@@ -1,0 +1,174 @@
+import Foundation
+import MLX
+import MLXNN
+import Spiketegaki
+
+/// MLX 上の SNN。層 0 は再帰 LIF、層 1 以降は FF LIF。
+/// 上位層は結合電流を RMSNorm し、前層の入力電流を足す。疎スパイクをそのまま
+/// 重み付けすると上位層が沈黙するため。
+public final class MLXSpikingNetwork: Module, @unchecked Sendable {
+    public let numLayers: Int
+    public let inputDim: Int
+    public let maxHiddenDim: Int
+    public let outputDim: Int
+    public let timeSteps: Int
+    public let lifConfig: LIFConfig
+    /// 分類ロジットに使う末尾フレーム数。
+    /// 重みインポート時に保存済みの値へ追従するため var。0 以下は 1 に丸める
+    public private(set) var readoutFrames: Int
+
+    // 層 0
+    public var wIn: MLXArray       // [inputDim, maxHiddenDim]
+    public var wRec: MLXArray      // [maxHiddenDim, maxHiddenDim]
+    public var bH: MLXArray        // [maxHiddenDim]
+
+    // 層 1 以降
+    public var wLayers: [MLXArray]   // 各 [maxHiddenDim, maxHiddenDim]
+    public var bHLayers: [MLXArray]  // 各 [maxHiddenDim]
+    public var gammaRMS: [MLXArray]  // 各 [maxHiddenDim]
+
+    // リードアウト
+    public var wOut: MLXArray      // [maxHiddenDim, outputDim]
+    public var bOut: MLXArray      // [outputDim]
+
+    /// `inputDim` はスキャンライン符号化のフレーム次元 (既定 64)。
+    /// `outputDim` は文字クラス数 (既定 3236)。
+    /// `readoutFrames` は損失・評価に使う末尾フレーム数 (既定 32 = 全フレーム平均)。
+    /// 末尾だけに絞ると実データでは劣る: kana 実験 (2026-09-24) の held-out 正解率は 32 で 63.8%、8 で 44.0%。
+    /// 0 以下を渡しても投げず 1 に丸める (CPU 側 `SpikingNetwork` と同じ扱い)。
+    public init(
+        numLayers: Int = 1,
+        inputDim: Int = 64,
+        maxHiddenDim: Int = 512,
+        outputDim: Int = 3236,
+        timeSteps: Int = 4,
+        lifConfig: LIFConfig = LIFConfig(),
+        readoutFrames: Int = 32
+    ) {
+        self.numLayers = max(1, numLayers)
+        self.inputDim = inputDim
+        self.maxHiddenDim = maxHiddenDim
+        self.outputDim = outputDim
+        self.timeSteps = timeSteps
+        self.lifConfig = lifConfig
+        self.readoutFrames = max(1, readoutFrames)
+
+        let scaleIn = sqrt(2.0 / Float(inputDim))
+        let scaleRec = 0.1 / sqrt(Float(maxHiddenDim))
+        let scaleOut = sqrt(2.0 / Float(maxHiddenDim))
+        let scaleLayer = sqrt(2.0 / Float(maxHiddenDim))
+
+        self.wIn = MLXRandom.uniform(low: -scaleIn, high: scaleIn, [inputDim, maxHiddenDim])
+        self.wRec = MLXRandom.uniform(low: -scaleRec, high: scaleRec, [maxHiddenDim, maxHiddenDim])
+        self.bH = MLXArray.zeros([maxHiddenDim])
+
+        var wl: [MLXArray] = []
+        var bl: [MLXArray] = []
+        var gl: [MLXArray] = []
+        var l = 1
+        while l < self.numLayers {
+            wl.append(MLXRandom.uniform(low: -scaleLayer, high: scaleLayer, [maxHiddenDim, maxHiddenDim]))
+            bl.append(MLXArray.zeros([maxHiddenDim]))
+            gl.append(MLXArray.ones([maxHiddenDim]))
+            l += 1
+        }
+        self.wLayers = wl
+        self.bHLayers = bl
+        self.gammaRMS = gl
+
+        self.wOut = MLXRandom.uniform(low: -scaleOut, high: scaleOut, [maxHiddenDim, outputDim])
+        self.bOut = MLXArray.zeros([outputDim])
+
+        super.init()
+    }
+
+    /// 保存済み重みから構成ごと復元する
+    public convenience init(weights: SpikingNetworkWeights) {
+        self.init(
+            numLayers: weights.numLayers,
+            inputDim: weights.inputDim,
+            maxHiddenDim: weights.maxHiddenDim,
+            outputDim: weights.outputDim,
+            timeSteps: weights.timeSteps,
+            lifConfig: weights.lifConfig,
+            readoutFrames: weights.readoutFrames
+        )
+        self.importWeights(from: weights)
+    }
+
+    /// SpikingNetworkWeights から重みをインポート。
+    /// [出力, 入力] の行優先なので転置して持つ
+    public func importWeights(from data: SpikingNetworkWeights) {
+        self.readoutFrames = max(1, data.readoutFrames)
+        let hSize = data.maxHiddenDim
+        // Module は Mirror で見つけたパラメータ配列をキャッシュする。プロパティに新しい MLXArray を
+        // 代入するとキャッシュ側の古い配列が optimizer.update の対象のまま残り、学習が止まる。
+        // update(parameters:) はキャッシュ済みの配列へ in-place に書き込むので、こちらを使う
+        var params = ModuleParameters()
+        params["wIn"] = .value(MLXArray(data.wIn, [hSize, data.inputDim]).transposed())
+        params["wRec"] = .value(MLXArray(data.wRec, [hSize, hSize]).transposed())
+        params["bH"] = .value(MLXArray(data.bH, [hSize]))
+        params["wOut"] = .value(MLXArray(data.wOut, [data.outputDim, hSize]).transposed())
+        params["bOut"] = .value(MLXArray(data.bOut, [data.outputDim]))
+
+        var layerW: [NestedItem<String, MLXArray>] = []
+        var layerB: [NestedItem<String, MLXArray>] = []
+        var layerG: [NestedItem<String, MLXArray>] = []
+        var l = 0
+        while l < min(self.wLayers.count, data.wLayers.count) {
+            layerW.append(.value(MLXArray(data.wLayers[l], [hSize, hSize]).transposed()))
+            layerB.append(.value(MLXArray(data.bHLayers[l], [hSize])))
+            layerG.append(.value(MLXArray(data.gammaRMS[l], [hSize])))
+            l += 1
+        }
+        if 0 < layerW.count {
+            params["wLayers"] = .array(layerW)
+            params["bHLayers"] = .array(layerB)
+            params["gammaRMS"] = .array(layerG)
+        }
+        self.update(parameters: params)
+        eval(self)
+    }
+
+    /// SpikingNetworkWeights へ重みをエクスポート
+    public func exportWeights(classLabels: [String]? = nil) -> SpikingNetworkWeights {
+        var arraysToEval: [MLXArray] = [self.wIn, self.wRec, self.bH, self.wOut, self.bOut]
+        var l = 0
+        while l < wLayers.count {
+            arraysToEval.append(wLayers[l])
+            arraysToEval.append(bHLayers[l])
+            arraysToEval.append(gammaRMS[l])
+            l += 1
+        }
+        eval(arraysToEval)
+
+        var wl: [[Float]] = []
+        var bl: [[Float]] = []
+        var gl: [[Float]] = []
+        l = 0
+        while l < wLayers.count {
+            wl.append(self.wLayers[l].transposed().asArray(Float.self))
+            bl.append(self.bHLayers[l].asArray(Float.self))
+            gl.append(self.gammaRMS[l].asArray(Float.self))
+            l += 1
+        }
+
+        return SpikingNetworkWeights(
+            inputDim: inputDim,
+            maxHiddenDim: maxHiddenDim,
+            outputDim: outputDim,
+            timeSteps: timeSteps,
+            lifConfig: lifConfig,
+            wIn: self.wIn.transposed().asArray(Float.self),
+            wRec: self.wRec.transposed().asArray(Float.self),
+            bH: self.bH.asArray(Float.self),
+            wLayers: wl,
+            bHLayers: bl,
+            gammaRMS: gl,
+            wOut: self.wOut.transposed().asArray(Float.self),
+            bOut: self.bOut.asArray(Float.self),
+            classLabels: classLabels,
+            readoutFrames: readoutFrames
+        )
+    }
+}
