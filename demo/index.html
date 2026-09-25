@@ -112,7 +112,8 @@
   .bar { height: 8px; background: #eae7e0; border-radius: 4px; overflow: hidden; }
   .bar > span { display: block; height: 100%; background: var(--accent); }
   .pct { text-align: right; font-variant-numeric: tabular-nums; font-size: 0.85rem; color: var(--sub); }
-  .empty { color: var(--sub); font-size: 0.85rem; }
+  /* 空メッセージの li は 3 列 grid のままだと 1 列目 (2.4rem) に押し込まれて 1 文字ずつ折り返す */
+  ol#results li.empty { display: block; color: var(--sub); font-size: 0.85rem; }
 </style>
 </head>
 <body>

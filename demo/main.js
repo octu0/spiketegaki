@@ -20,6 +20,10 @@ const TOP_K = 5;
 // に対し 1.5 では細すぎたので 2.0 にした。2.25 以上にすると小さい字の輪が潰れて悪化する。
 const STROKE_WIDTH = (PAD / SIDE) * 2.0;
 const IDLE_MS = 150;      // ペンを離してから認識するまで
+// 正規化した 32x32 に残る墨の総量 (0..255 の和) の下限。255 換算で 20 画素ぶん。
+// これを下回る入力は線が薄すぎ / 細すぎて、分類器の出力が文字と無関係になる
+// (墨が 1 画素も閾値を越えないと ImageNormalizer は全 0 を返す)。
+const MIN_INK_SUM = 5100;
 
 const pad = document.getElementById('pad');
 const preview = document.getElementById('preview');
@@ -135,16 +139,21 @@ function recognize() {
     return;
   }
 
-  // 正規化した結果に墨が 1 画素も残らなかった場合 (線が薄すぎる / 細すぎる)、
-  // ImageNormalizer は全 0 の画像を返す。その出力は文字とは無関係なので候補を出さない。
+  // 正規化した 32x32 の墨が少なすぎるときは、分類器の出力が文字と無関係になるので候補を出さない
   const normalized = e.stg_last_normalized(wasm.normPtr) === SIDE * SIDE
     ? new Uint8Array(e.memory.buffer, wasm.normPtr, SIDE * SIDE)
     : null;
-  if (normalized !== null && !normalized.some((v) => v > 0)) {
-    showEmpty('線が薄すぎて墨として拾えませんでした。もう少し濃く / 大きく書いてください');
-    timing.textContent = '';
-    clearPreview();
-    return;
+  if (normalized !== null) {
+    let inkSum = 0;
+    for (let i = 0; i < normalized.length; i += 1) {
+      inkSum += normalized[i];
+    }
+    if (inkSum < MIN_INK_SUM) {
+      showEmpty('まだ認識していません (線が薄すぎます)');
+      timing.textContent = '';
+      clearPreview();
+      return;
+    }
   }
 
   const buffer = e.memory.buffer;
