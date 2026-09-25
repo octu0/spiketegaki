@@ -1,5 +1,3 @@
-import Foundation
-
 public enum ImageNormalizerError: Error, Equatable {
     /// width か height が 0 以下
     case invalidSize(width: Int, height: Int)

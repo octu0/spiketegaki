@@ -1,5 +1,3 @@
-import Foundation
-
 public enum CharacterClassifierError: Error, Equatable {
     /// ネットワークの出力次元が語彙数と違う。index がずれたまま推論すると
     /// 別の文字を返すので、生成時に弾く。

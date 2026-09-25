@@ -1,5 +1,3 @@
-import Foundation
-
 /// LIF (Leaky Integrate-and-Fire) ニューロン設定パラメータ
 public struct LIFConfig: Sendable, Equatable {
     public let beta: Float      // 膜電位減衰率 (0.0 < beta < 1.0)

@@ -30,6 +30,10 @@ let package = Package(
         .executable(
             name: "recognize",
             targets: ["recognize"]
+        ),
+        .executable(
+            name: "SpiketegakiWASM",
+            targets: ["SpiketegakiWASM"]
         )
     ],
     dependencies: [
@@ -79,6 +83,24 @@ let package = Package(
             name: "recognize",
             dependencies: ["Spiketegaki"],
             path: "script/recognize"
+        ),
+        // ブラウザ / node から呼ぶ wasm の窓口。推論ライブラリだけに依存する。
+        // macOS では #if os(WASI) の外側が空になるので、通常のビルドにもテストにも影響しない。
+        .executableTarget(
+            name: "SpiketegakiWASM",
+            dependencies: ["Spiketegaki"],
+            path: "Sources/SpiketegakiWASM",
+            linkerSettings: [
+                // wasm-ld は要求した記号だけをエクスポートする。@_cdecl だけでは足りない
+                .unsafeFlags([
+                    "-Xlinker", "--export=stg_alloc",
+                    "-Xlinker", "--export=stg_load_weights",
+                    "-Xlinker", "--export=stg_classify",
+                    "-Xlinker", "--export=stg_char",
+                    "-Xlinker", "--export=stg_last_normalized",
+                    "-Xlinker", "--export=stg_last_micros"
+                ], .when(platforms: [.wasi]))
+            ]
         ),
         // フォント非依存の単体テスト
         .testTarget(

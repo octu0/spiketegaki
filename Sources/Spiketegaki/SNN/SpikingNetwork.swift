@@ -1,5 +1,3 @@
-import Foundation
-
 /// 上位層の電流 RMSNorm で分散 0 のときの除算を避ける微小値 (学習側 MLX と共有)
 public let rmsNormEpsilon: Float = 1e-5
 

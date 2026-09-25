@@ -5,10 +5,18 @@
 
 CONFIG := release
 
+# wasm (SwiftWasm) ビルドの設定。既定の swift は Xcode 付属なので、
+# SDK と同じバージョンのツールチェーンを swiftly 経由で呼ぶ
+WASM_TOOLCHAIN := 6.2.3
+WASM_SDK := swift-6.2.3-RELEASE_wasm
+WASM_TRIPLE := wasm32-unknown-wasip1
+DEMO_DIR := .tmp/demo
+DEMO_PORT := 8080
+
 # 各 script への引数 (例: make render ARGS="--scripts hiragana")
 ARGS ?=
 
-.PHONY: all build test xbuild xtest xtrain vocab render recognize clean help
+.PHONY: all build test xbuild xtest xtrain vocab render recognize wasm demo clean help
 
 all: build test
 
@@ -49,6 +57,22 @@ render:
 recognize:
 	swift run -c $(CONFIG) recognize $(ARGS)
 
+## SwiftWasm SDK で wasm をビルドし、wasm-opt -Oz をかけて $(DEMO_DIR) に置く
+wasm:
+	swiftly run +$(WASM_TOOLCHAIN) swift build -c $(CONFIG) --swift-sdk $(WASM_SDK) --product SpiketegakiWASM
+	@mkdir -p $(DEMO_DIR)
+	wasm-opt -Oz --strip-debug -o $(DEMO_DIR)/spiketegaki.wasm .build/$(WASM_TRIPLE)/$(CONFIG)/SpiketegakiWASM.wasm
+	@ls -l .build/$(WASM_TRIPLE)/$(CONFIG)/SpiketegakiWASM.wasm $(DEMO_DIR)/spiketegaki.wasm
+
+## デモ一式を $(DEMO_DIR) に置いて http://localhost:$(DEMO_PORT)/ で配信する
+## (先に make wasm と recognize --export-weights が要る)
+demo:
+	@mkdir -p $(DEMO_DIR)
+	cp demo/index.html demo/main.js $(DEMO_DIR)/
+	@test -f $(DEMO_DIR)/spiketegaki.wasm || echo "警告: $(DEMO_DIR)/spiketegaki.wasm がありません (make wasm)"
+	@test -f $(DEMO_DIR)/kana.stgw || echo "警告: $(DEMO_DIR)/kana.stgw がありません (recognize --export-weights)"
+	python3 -m http.server $(DEMO_PORT) --directory $(DEMO_DIR)
+
 ## ビルド成果物のクリーン
 clean:
 	swift package clean
@@ -64,6 +88,8 @@ help:
 	@echo "  make vocab ARGS=\"...\"         - swift run -c release vocab"
 	@echo "  make render ARGS=\"...\"        - swift run -c release render"
 	@echo "  make recognize ARGS=\"...\"     - swift run -c release recognize"
+	@echo "  make wasm                     - SwiftWasm でビルドし $(DEMO_DIR)/spiketegaki.wasm を作る"
+	@echo "  make demo                     - デモを $(DEMO_DIR) に置いて localhost:$(DEMO_PORT) で配信"
 	@echo "  make clean                    - ビルド成果物をクリーン"
 	@echo ""
 	@echo "MLX を使う学習とテストは x 付き (make xtrain / make xtest) だけです。swift run では動きません。"

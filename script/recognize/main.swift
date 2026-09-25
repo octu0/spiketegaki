@@ -32,6 +32,7 @@ struct Options {
     var dumpSamplesDir: String?
     var dumpCount = 20
     var dumpScale = 8
+    var exportWeightsPath: String?
     var pngPaths: [String] = []
 
     static func parse(_ args: [String]) -> Options {
@@ -67,6 +68,7 @@ struct Options {
             case "--dump-samples":   o.dumpSamplesDir = next(a)
             case "--dump-count":     o.dumpCount = int(a, min: 1)
             case "--dump-scale":     o.dumpScale = int(a, min: 1)
+            case "--export-weights": o.exportWeightsPath = next(a)
             case "--help", "-h":     printUsage(); exit(0)
             default:
                 if a.hasPrefix("--") {
@@ -87,6 +89,7 @@ func printUsage() {
       swift run -c release recognize --weights <json> [--invert] <png...>
       swift run -c release recognize --weights <json> --dataset <stgk> [--limit N]
       swift run -c release recognize --random-weights --layers 4 --hidden 512 --dataset <stgk>
+      swift run -c release recognize --weights <json> --export-weights <stgw>
 
       --weights <json>        SpikingNetworkWeights の JSON
       --random-weights        重みを乱数で作る (動作確認用。正解率はチャンスレベルになる)
@@ -101,6 +104,7 @@ func printUsage() {
       --dump-samples <dir>    --dataset のサンプルを PNG に書き出す
       --dump-count <n>        書き出す枚数 (既定 20)
       --dump-scale <n>        書き出し時の拡大率 (既定 8 -> 256x256)
+      --export-weights <stgw> 重みをバイナリ形式 (STGW v1) に書き出して終了する
     """)
 }
 
@@ -516,10 +520,69 @@ func inkBoundingBox(_ image: CharacterImage) -> (minX: Int, minY: Int, maxX: Int
     return maxX < 0 ? nil : (minX, minY, maxX, maxY)
 }
 
+// MARK: - 重みのバイナリ書き出し
+
+/// 重み JSON を STGW v1 のバイナリに変換する。wasm では JSON を通さずこれを読む。
+/// 書き出した後に読み戻して元と一致することまで確かめる (黙って壊れた重みを配らない)。
+func runExportWeights(_ o: Options, to outPath: String) -> Int32 {
+    guard let jsonPath = o.weightsPath else {
+        fail("--export-weights には --weights <json> が要ります")
+    }
+    let srcURL = URL(fileURLWithPath: jsonPath)
+    if !FileManager.default.fileExists(atPath: srcURL.path) {
+        fail("重みファイルがありません: \(jsonPath)")
+    }
+    let weights: SpikingNetworkWeights
+    do {
+        weights = try SpikingNetworkWeights.load(from: srcURL)
+    } catch {
+        fail("重みを読めません: \(jsonPath): \(error)")
+    }
+
+    let bytes = weights.binary()
+    let dstURL = URL(fileURLWithPath: outPath)
+    let dir = dstURL.deletingLastPathComponent()
+    do {
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        try Data(bytes).write(to: dstURL, options: .atomic)
+    } catch {
+        fail("書き出せません: \(outPath): \(error)")
+    }
+
+    // 往復検証
+    let restored: SpikingNetworkWeights
+    do {
+        let data = try Data(contentsOf: dstURL)
+        restored = try SpikingNetworkWeights(binary: [UInt8](data))
+    } catch {
+        fail("書き出した \(outPath) を読み戻せません: \(error)")
+    }
+    if restored != weights {
+        fail("書き出した \(outPath) が元の重みと一致しません")
+    }
+
+    let jsonSize = (try? FileManager.default.attributesOfItem(atPath: srcURL.path)[.size] as? Int) ?? nil
+    print("重みを書き出しました: \(outPath)")
+    print("  形式          : STGW v\(SpikingNetworkWeights.binaryVersion) (リトルエンディアン float32)")
+    print("  層数          : \(weights.numLayers)  隠れ次元 \(weights.maxHiddenDim)  出力 \(weights.outputDim)")
+    print("  timeSteps     : \(weights.timeSteps)  readoutFrames \(weights.readoutFrames)")
+    print("  classLabels   : \(weights.classLabels?.count.description ?? "なし")")
+    print("  バイト数      : \(bytes.count)  (\(String(format: "%.2f", Double(bytes.count) / 1_048_576.0)) MiB)")
+    if let n = jsonSize {
+        print("  元の JSON     : \(n) バイト (\(String(format: "%.2f", Double(n) / 1_048_576.0)) MiB)")
+    }
+    print("  往復検証      : 読み戻して元の重みと完全一致")
+    return 0
+}
+
 // MARK: - 本体
+
 
 func run() {
     let o = Options.parse(Array(CommandLine.arguments.dropFirst()))
+    if let out = o.exportWeightsPath {
+        exit(runExportWeights(o, to: out))
+    }
     if o.datasetPath == nil && o.pngPaths.isEmpty {
         printUsage()
         fail("PNG のパスか --dataset を指定してください")

@@ -1,5 +1,3 @@
-import Foundation
-
 public enum CharacterImageError: Error, Equatable {
     /// 画素数が `CharacterImage.pixelCount` (1024) と違う
     case invalidPixelCount(expected: Int, actual: Int)

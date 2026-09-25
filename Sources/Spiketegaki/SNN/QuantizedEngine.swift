@@ -1,5 +1,3 @@
-import Foundation
-
 public enum QuantizedFormat: Sendable, Equatable {
     case int16
     case int32

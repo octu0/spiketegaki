@@ -1,4 +1,6 @@
-import Foundation
+// DatasetFile は学習データの読み書き専用で、wasm の推論経路では使わない。
+// FileHandle / NSNumber は WASI の FoundationEssentials に無いので、WASI ビルドから外す。
+#if !os(WASI)
 
 public enum DatasetFileError: Error, Equatable {
     /// 先頭 4 バイトが "STGK" でない
@@ -332,7 +334,7 @@ public struct DatasetMeta: Codable, Sendable, Equatable {
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         let data = try encoder.encode(self)
         do {
-            try data.write(to: url, options: .atomic)
+            try data.write(to: url, options: [])
         } catch {
             throw DatasetFileError.ioFailure("メタ JSON を書けない: \(url.path): \(error)")
         }
@@ -348,3 +350,5 @@ public struct DatasetMeta: Codable, Sendable, Equatable {
         return try JSONDecoder().decode(DatasetMeta.self, from: data)
     }
 }
+
+#endif

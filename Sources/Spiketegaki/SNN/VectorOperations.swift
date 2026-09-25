@@ -1,5 +1,3 @@
-import Foundation
-
 /// Float バッファのベクトル演算。
 public enum VectorOperations {
     /// 内積。SIMD8。

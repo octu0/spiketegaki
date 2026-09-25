@@ -1,5 +1,3 @@
-import Foundation
-
 /// `SpikingNetwork.classifyLogits` が投げるエラー。
 /// 仕様外の入力でクラッシュさせず、呼び出し側に理由を返すため。
 public enum SequenceClassifierError: Error, Equatable {

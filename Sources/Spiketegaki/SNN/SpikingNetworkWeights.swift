@@ -1,5 +1,3 @@
-import Foundation
-
 /// SNN 重みの JSON 表現。クラスラベルを同梱できる。
 public struct SpikingNetworkWeights: Sendable, Codable, Equatable {
     public let inputDim: Int
@@ -138,7 +136,7 @@ public struct SpikingNetworkWeights: Sendable, Codable, Equatable {
     public func save(to url: URL) throws {
         let encoder = JSONEncoder()
         let data = try encoder.encode(self)
-        try data.write(to: url, options: .atomic)
+        try data.write(to: url, options: [])
     }
 
     public static func load(from url: URL) throws -> SpikingNetworkWeights {

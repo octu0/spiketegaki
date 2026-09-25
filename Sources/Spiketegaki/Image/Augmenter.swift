@@ -1,5 +1,3 @@
-import Foundation
-
 /// 学習データの拡張。乱数はシード固定の xorshift64* で、
 /// 同じ seed なら必ず同じ系列・同じ出力になる (`SystemRandomNumberGenerator` は使わない)。
 ///

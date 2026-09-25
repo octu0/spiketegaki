@@ -1,5 +1,3 @@
-import Foundation
-
 /// 文字集合の区分。index の並び順もこの順序。
 public enum ScriptCategory: String, Sendable, Equatable, CaseIterable {
     case digits

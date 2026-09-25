@@ -1,5 +1,3 @@
-import Foundation
-
 /// Adam オプティマイザ設定
 public struct AdamConfig: Sendable, Equatable {
     public let lr: Float
