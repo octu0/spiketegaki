@@ -16,7 +16,9 @@ const WEIGHTS_URL = 'kana.stgw';
 const SIDE = 32;          // 正規化後の一辺
 const PAD = 256;          // マス目の一辺
 const TOP_K = 5;
-const STROKE_WIDTH = (PAD / SIDE) * 1.5;   // 32x32 に落としたとき 1.5 画素ぶんの太さ
+// 32x32 に落としたときのペンの太さ。学習データの線幅 (同じ測り方で 32x32 換算 3.3〜3.8 画素)
+// に対し 1.5 では細すぎたので 2.0 にした。2.25 以上にすると小さい字の輪が潰れて悪化する。
+const STROKE_WIDTH = (PAD / SIDE) * 2.0;
 const IDLE_MS = 150;      // ペンを離してから認識するまで
 
 const pad = document.getElementById('pad');
@@ -87,7 +89,7 @@ async function boot() {
     probPtr: exports.stg_alloc(TOP_K * 4),
     normPtr: exports.stg_alloc(SIDE * SIDE)
   };
-  setStatus(`準備完了 (重み ${(weights.length / 1048576).toFixed(1)} MiB)。枠の中に 1 文字書いてください。`);
+  setStatus(`準備完了 (重み ${(weights.length / 1048576).toFixed(1)} MiB)。内枠いっぱいに 1 文字書いてください。`);
 }
 
 async function fetchArrayBuffer(url) {
@@ -133,6 +135,18 @@ function recognize() {
     return;
   }
 
+  // 正規化した結果に墨が 1 画素も残らなかった場合 (線が薄すぎる / 細すぎる)、
+  // ImageNormalizer は全 0 の画像を返す。その出力は文字とは無関係なので候補を出さない。
+  const normalized = e.stg_last_normalized(wasm.normPtr) === SIDE * SIDE
+    ? new Uint8Array(e.memory.buffer, wasm.normPtr, SIDE * SIDE)
+    : null;
+  if (normalized !== null && !normalized.some((v) => v > 0)) {
+    showEmpty('線が薄すぎて墨として拾えませんでした。もう少し濃く / 大きく書いてください');
+    timing.textContent = '';
+    clearPreview();
+    return;
+  }
+
   const buffer = e.memory.buffer;
   const indices = new Int32Array(buffer, wasm.idxPtr, n);
   const probabilities = new Float32Array(buffer, wasm.probPtr, n);
@@ -148,8 +162,8 @@ function recognize() {
   const micros = Number(e.stg_last_micros());
   timing.textContent = `推論 ${(micros / 1000).toFixed(1)} ms`;
 
-  if (e.stg_last_normalized(wasm.normPtr) === SIDE * SIDE) {
-    drawPreview(new Uint8Array(e.memory.buffer, wasm.normPtr, SIDE * SIDE));
+  if (normalized !== null) {
+    drawPreview(normalized);
   }
 }
 

@@ -9,6 +9,9 @@
     --bg: #f6f5f2;
     --panel: #ffffff;
     --line: #d8d4cc;
+    /* 十字 (中心の目安) は従、内枠 (em の目安) は主。内枠の方を濃くする */
+    --cross: #e6e3dc;
+    --guide: #c7c1b4;
     --ink: #1c1b18;
     --sub: #6b665d;
     --accent: #3b6ea5;
@@ -35,7 +38,7 @@
   }
   .card h2 { font-size: 0.8rem; margin: 0 0 10px; color: var(--sub); font-weight: 600; letter-spacing: .04em; }
 
-  /* マス目。枠と十字の目安は CSS の背景なので、描いた墨とは混ざらない */
+  /* マス目。枠・十字・内枠はすべて canvas の背景か外側の要素なので、描いた墨とは混ざらない */
   #pad {
     display: block;
     width: 256px;
@@ -44,10 +47,32 @@
     cursor: crosshair;
     background-color: #fff;
     background-image:
-      linear-gradient(to right, transparent calc(50% - 1px), var(--line) calc(50% - 1px), var(--line) calc(50% + 1px), transparent calc(50% + 1px)),
-      linear-gradient(to bottom, transparent calc(50% - 1px), var(--line) calc(50% - 1px), var(--line) calc(50% + 1px), transparent calc(50% + 1px));
+      linear-gradient(to right, transparent calc(50% - 1px), var(--cross) calc(50% - 1px), var(--cross) calc(50% + 1px), transparent calc(50% + 1px)),
+      linear-gradient(to bottom, transparent calc(50% - 1px), var(--cross) calc(50% - 1px), var(--cross) calc(50% + 1px), transparent calc(50% + 1px));
     border: 2px solid var(--ink);
     border-radius: 4px;
+  }
+
+  /* 内枠 (em の目安)。マス目の中央 85%。
+     フォントから作った学習データでは字の高さがマス目の 0.81〜0.88 に集まるので、
+     この枠いっぱいに書くと学習時と同じ大きさになる。小さく書くと小書き仮名 (ケ と ヶ など)
+     と見分けがつかなくなる。 */
+  #padFrame {
+    position: relative;
+    display: inline-block;
+    font-size: 0;
+  }
+  #padFrame::after {
+    content: "";
+    position: absolute;
+    /* canvas の枠 2px の内側がマス目そのもの。そこから中央 85% に縮める */
+    top: 2px;
+    right: 2px;
+    bottom: 2px;
+    left: 2px;
+    transform: scale(0.85);
+    border: 1px solid var(--guide);
+    pointer-events: none;
   }
   #preview {
     display: block;
@@ -94,14 +119,15 @@
 <main>
   <h1>spiketegaki — SNN 手書き 1 文字認識 (wasm)</h1>
   <p class="lead">
-    枠の中に 1 文字書いてください。ペンを離して 150 ms 後に自動で認識します。
+    <strong>内枠いっぱいに 1 文字書いてください。</strong>内枠は em の目安で、学習データの字の大きさに合わせてあります。
+    小さく書くと小書き仮名 (ケ と ヶ、よ と ょ) と見分けがつきません。ペンを離して 150 ms 後に自動で認識します。
     推論は SwiftWasm でビルドした純 Swift の SNN が、このページの中で走ります。
   </p>
 
   <div class="columns">
     <div class="card">
-      <h2>マス目 (256 x 256)</h2>
-      <canvas id="pad" width="256" height="256"></canvas>
+      <h2>マス目 (256 x 256) / 内枠 = em の目安</h2>
+      <div id="padFrame"><canvas id="pad" width="256" height="256"></canvas></div>
       <div class="row">
         <button id="clear" type="button">クリア</button>
         <span id="timing"></span>

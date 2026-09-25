@@ -1,7 +1,7 @@
 /// 学習データの拡張。乱数はシード固定の xorshift64* で、
 /// 同じ seed なら必ず同じ系列・同じ出力になる (`SystemRandomNumberGenerator` は使わない)。
 ///
-/// `augment(_:)` の順序:
+/// `augment(_:smallKana:)` の順序:
 ///   幾何変形 (せん断・回転・平行移動・拡縮、いずれもマス目中心基準) → 膨張
 ///   → 弾性変形 → 値域を [0, 1] にクランプ (マス目外へ出た墨は捨てる)
 ///   → 最後にノイズ (ガウス・ごま塩)。
@@ -14,6 +14,13 @@
 ///
 /// 膨張は 1〜2px の等確率で、確率 0.6 で起きる (2026-09-25 に 1px / 確率 1/3 から強化)。
 /// 手書きの線はキャンバス上で 32px 換算 2〜3px と太く、フォントの 1〜1.5px より太いため。
+///
+/// 拡縮だけはクラスで範囲が違う。通常字は 0.60〜1.15、小書き仮名 (ぁぃぅぇぉっゃゅょゎゕゖ /
+/// ァィゥェォッャュョヮヵヶ の 24 字) は 0.70〜1.00 で、`augment(_:smallKana:)` の引数で選ぶ
+/// (2026-09-25 の手書き誤認識調査: 手書きはフォントよりマス目に対して小さく書かれる
+/// (高さ比 0.47〜0.72 に対し学習データの平均 0.80〜0.85) ため通常字の縮小側を広げ、
+/// 小書き仮名は拡大しないことで「小さい = 小書き」という大きさの手掛かりを保つ)。
+/// どちらの範囲でも乱数の消費数は同じなので、クラスを変えても以降の系列はずれない。
 public final class Augmenter: @unchecked Sendable {
     /// 拡張パラメータ。
     public struct Parameters: Sendable, Equatable {
@@ -23,8 +30,10 @@ public final class Augmenter: @unchecked Sendable {
         public var rotationDegreesRange: ClosedRange<Float>
         /// 平行移動: ±5px
         public var translationRange: ClosedRange<Float>
-        /// 拡縮: 0.7〜1.15
+        /// 拡縮 (通常字): 0.60〜1.15
         public var scaleRange: ClosedRange<Float>
+        /// 拡縮 (小書き仮名): 0.70〜1.00。拡大しないことで通常字との大きさの差を保つ
+        public var smallKanaScaleRange: ClosedRange<Float>
         /// 太さ: この確率で膨張する (残りは変化なし)
         public var thicknessProbability: Float
         /// 太さ: 膨張する場合の最大 px 数。1〜この値の等確率で選ぶ
@@ -42,7 +51,8 @@ public final class Augmenter: @unchecked Sendable {
             shearRange: ClosedRange<Float> = -0.3 ... 0.3,
             rotationDegreesRange: ClosedRange<Float> = -10.0 ... 10.0,
             translationRange: ClosedRange<Float> = -5.0 ... 5.0,
-            scaleRange: ClosedRange<Float> = 0.7 ... 1.15,
+            scaleRange: ClosedRange<Float> = 0.60 ... 1.15,
+            smallKanaScaleRange: ClosedRange<Float> = 0.70 ... 1.00,
             thicknessProbability: Float = 0.6,
             maxDilationPixels: Int = 2,
             elasticAmplitude: Float = 1.5,
@@ -54,6 +64,7 @@ public final class Augmenter: @unchecked Sendable {
             self.rotationDegreesRange = rotationDegreesRange
             self.translationRange = translationRange
             self.scaleRange = scaleRange
+            self.smallKanaScaleRange = smallKanaScaleRange
             self.thicknessProbability = thicknessProbability
             self.maxDilationPixels = maxDilationPixels
             self.elasticAmplitude = elasticAmplitude
@@ -75,10 +86,13 @@ public final class Augmenter: @unchecked Sendable {
     // MARK: - 拡張全体
 
     /// 型の doc コメントに書いた順序で 1 回分の拡張を行う。
-    public func augment(_ image: CharacterImage) -> CharacterImage {
+    /// `smallKana` が真なら拡縮に `smallKanaScaleRange` を、偽なら `scaleRange` を使う。
+    public func augment(_ image: CharacterImage, smallKana: Bool = false) -> CharacterImage {
         let shearAmount = nextUniform(in: parameters.shearRange)
         let degrees = nextUniform(in: parameters.rotationDegreesRange)
-        let scaleFactor = nextUniform(in: parameters.scaleRange)
+        let scaleFactor = nextUniform(
+            in: smallKana ? parameters.smallKanaScaleRange : parameters.scaleRange
+        )
         let dx = nextUniform(in: parameters.translationRange)
         let dy = nextUniform(in: parameters.translationRange)
 

@@ -254,6 +254,14 @@ enum FontOrigin {
     }
 }
 
+/// 小書き仮名 (捨て仮名)。拡張の拡縮範囲を通常字と分けるためだけに使う
+/// (DESIGN.md §7: 通常字 0.60〜1.15 / 小書き仮名 0.70〜1.00)。
+/// 語彙側 (`CharacterVocabulary`) には持たせない。render の拡張の都合でしかないため。
+/// 一覧は DESIGN.md §7 のとおり 24 字 (ひらがな 12 + カタカナ 12)。
+let smallKanaScalars: Set<Unicode.Scalar> = Set(
+    "ぁぃぅぇぉっゃゅょゎゕゖァィゥェォッャュョヮヵヶ".unicodeScalars
+)
+
 /// 読み込みに成功したフォント 1 つ。CTFont は不変で thread-safe なのでサイズ別に作り置きする。
 final class FontEntry: @unchecked Sendable {
     let postScriptName: String
@@ -1260,9 +1268,14 @@ func run() {
                 }
                 stats.drawn += 1
                 batch.append((label: item.index, image: base))
+                // 拡縮の範囲だけクラスで分ける (小書き仮名は拡大しない)
+                let isSmallKana = smallKanaScalars.contains(item.scalar)
                 var a = 0
                 while a < options.augment {
-                    batch.append((label: item.index, image: augmenter.augment(base)))
+                    batch.append((
+                        label: item.index,
+                        image: augmenter.augment(base, smallKana: isSmallKana)
+                    ))
                     a += 1
                 }
             }
