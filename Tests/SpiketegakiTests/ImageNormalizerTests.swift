@@ -250,25 +250,6 @@ final class ImageNormalizerTests: XCTestCase {
         }
     }
 
-    // MARK: - 冪等性
-
-    /// 切り出さないので、32x32 に対して掛け直しても何も変わらない (冪等)。
-    func testCellModeIsIdempotentOn32x32() throws {
-        let gray = rectImage(width: 64, height: 64, x: 8, y: 20, w: 24, h: 16)
-        let once = try ImageNormalizer.normalize(width: 64, height: 64, gray: gray, invert: false)
-        var twice = once
-        var pass = 0
-        while pass < 5 {
-            twice = ImageNormalizer.normalize(twice)
-            pass += 1
-        }
-        var i = 0
-        while i < CharacterImage.pixelCount {
-            XCTAssertEqual(twice.pixels[i], once.pixels[i], accuracy: 1e-6, "画素 \(i) が動いた")
-            i += 1
-        }
-    }
-
     // MARK: - エラー
 
     func testPixelCountMismatchThrows() {

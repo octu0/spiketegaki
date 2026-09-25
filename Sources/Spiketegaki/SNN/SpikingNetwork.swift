@@ -24,18 +24,18 @@ public final class SpikingNetwork: @unchecked Sendable {
     public private(set) var wOutT: [Float] = []
 
     // 層 0 (再帰 LIF 層)
-    public let pWIn: Parameter
-    public let pWRec: Parameter
-    public let pBH: Parameter
+    public var wIn: [Float]            // [maxHiddenDim * inputDim]
+    public var wRec: [Float]           // [maxHiddenDim * maxHiddenDim]
+    public var bH: [Float]             // [maxHiddenDim]
 
     // 層 1 以降 (前層スパイクを受けるフィードフォワード LIF 層)
-    public let pWLayers: [Parameter]
-    public let pBHLayers: [Parameter]
-    public let pGammaRMS: [Parameter]
+    public var wLayers: [[Float]]      // [numLayers - 1][maxHiddenDim * maxHiddenDim]
+    public var bHLayers: [[Float]]     // [numLayers - 1][maxHiddenDim]
+    public var gammaRMS: [[Float]]     // [numLayers - 1][maxHiddenDim]
 
     // リードアウト
-    public let pWOut: Parameter        // [outputDim, maxHiddenDim]
-    public let pBOut: Parameter
+    public var wOut: [Float]           // [outputDim * maxHiddenDim]
+    public var bOut: [Float]           // [outputDim]
 
     /// `inputDim` はスキャンライン符号化のフレーム次元 (既定 64)。
     /// `outputDim` は文字クラス数 (既定 3236)。
@@ -79,9 +79,9 @@ public final class SpikingNetwork: @unchecked Sendable {
         let initBH = [Float](repeating: 0.35, count: maxHiddenDim)
 
         // 上位層パラメータの初期化
-        var wLayersList: [Parameter] = []
-        var bhLayersList: [Parameter] = []
-        var gammaRMSList: [Parameter] = []
+        var wLayersList: [[Float]] = []
+        var bhLayersList: [[Float]] = []
+        var gammaRMSList: [[Float]] = []
         let scaleLayer = sqrt(2.0 / Float(maxHiddenDim))
 
         var l = 1
@@ -95,9 +95,9 @@ public final class SpikingNetwork: @unchecked Sendable {
             let initBHL = [Float](repeating: 0.0, count: maxHiddenDim)
             let initGamma = [Float](repeating: 1.0, count: maxHiddenDim)
 
-            wLayersList.append(Parameter(count: maxHiddenDim * maxHiddenDim, initialData: initWLayer))
-            bhLayersList.append(Parameter(count: maxHiddenDim, initialData: initBHL))
-            gammaRMSList.append(Parameter(count: maxHiddenDim, initialData: initGamma))
+            wLayersList.append(initWLayer)
+            bhLayersList.append(initBHL)
+            gammaRMSList.append(initGamma)
             l += 1
         }
 
@@ -111,14 +111,14 @@ public final class SpikingNetwork: @unchecked Sendable {
 
         let initBOut = [Float](repeating: 0.0, count: outputDim)
 
-        self.pWIn = Parameter(count: maxHiddenDim * inputDim, initialData: initWIn)
-        self.pWRec = Parameter(count: maxHiddenDim * maxHiddenDim, initialData: initWRec)
-        self.pBH = Parameter(count: maxHiddenDim, initialData: initBH)
-        self.pWLayers = wLayersList
-        self.pBHLayers = bhLayersList
-        self.pGammaRMS = gammaRMSList
-        self.pWOut = Parameter(count: outputDim * maxHiddenDim, initialData: initWOut)
-        self.pBOut = Parameter(count: outputDim, initialData: initBOut)
+        self.wIn = initWIn
+        self.wRec = initWRec
+        self.bH = initBH
+        self.wLayers = wLayersList
+        self.bHLayers = bhLayersList
+        self.gammaRMS = gammaRMSList
+        self.wOut = initWOut
+        self.bOut = initBOut
 
         rebuildInferenceLayout()
     }
@@ -137,20 +137,6 @@ public final class SpikingNetwork: @unchecked Sendable {
         self.importWeights(from: weights)
     }
 
-    public var parameters: [Parameter] {
-        var params: [Parameter] = [pWIn, pWRec, pBH]
-        var l = 0
-        while l < pWLayers.count {
-            params.append(pWLayers[l])
-            params.append(pBHLayers[l])
-            params.append(pGammaRMS[l])
-            l += 1
-        }
-        params.append(pWOut)
-        params.append(pBOut)
-        return params
-    }
-
     /// 全体重みのエクスポート
     public func exportWeights(classLabels: [String]? = nil) -> SpikingNetworkWeights {
         return SpikingNetworkWeights(
@@ -159,14 +145,14 @@ public final class SpikingNetwork: @unchecked Sendable {
             outputDim: outputDim,
             timeSteps: timeSteps,
             lifConfig: lifConfig,
-            wIn: pWIn.data,
-            wRec: pWRec.data,
-            bH: pBH.data,
-            wLayers: pWLayers.map { $0.data },
-            bHLayers: pBHLayers.map { $0.data },
-            gammaRMS: pGammaRMS.map { $0.data },
-            wOut: pWOut.data,
-            bOut: pBOut.data,
+            wIn: wIn,
+            wRec: wRec,
+            bH: bH,
+            wLayers: wLayers,
+            bHLayers: bHLayers,
+            gammaRMS: gammaRMS,
+            wOut: wOut,
+            bOut: bOut,
             classLabels: classLabels,
             readoutFrames: readoutFrames
         )
@@ -176,33 +162,33 @@ public final class SpikingNetwork: @unchecked Sendable {
     public func importWeights(from weightsData: SpikingNetworkWeights) {
         self.lifConfig = weightsData.lifConfig
         self.readoutFrames = max(1, weightsData.readoutFrames)
-        if weightsData.wIn.count == pWIn.data.count {
-            pWIn.data = weightsData.wIn
+        if weightsData.wIn.count == wIn.count {
+            wIn = weightsData.wIn
         }
-        if weightsData.wRec.count == pWRec.data.count {
-            pWRec.data = weightsData.wRec
+        if weightsData.wRec.count == wRec.count {
+            wRec = weightsData.wRec
         }
-        if weightsData.bH.count == pBH.data.count {
-            pBH.data = weightsData.bH
+        if weightsData.bH.count == bH.count {
+            bH = weightsData.bH
         }
         var l = 0
-        while l < min(pWLayers.count, weightsData.wLayers.count) {
-            if weightsData.wLayers[l].count == pWLayers[l].data.count {
-                pWLayers[l].data = weightsData.wLayers[l]
+        while l < min(wLayers.count, weightsData.wLayers.count) {
+            if weightsData.wLayers[l].count == wLayers[l].count {
+                wLayers[l] = weightsData.wLayers[l]
             }
-            if weightsData.bHLayers[l].count == pBHLayers[l].data.count {
-                pBHLayers[l].data = weightsData.bHLayers[l]
+            if weightsData.bHLayers[l].count == bHLayers[l].count {
+                bHLayers[l] = weightsData.bHLayers[l]
             }
-            if weightsData.gammaRMS[l].count == pGammaRMS[l].data.count {
-                pGammaRMS[l].data = weightsData.gammaRMS[l]
+            if weightsData.gammaRMS[l].count == gammaRMS[l].count {
+                gammaRMS[l] = weightsData.gammaRMS[l]
             }
             l += 1
         }
-        if weightsData.wOut.count == pWOut.data.count {
-            pWOut.data = weightsData.wOut
+        if weightsData.wOut.count == wOut.count {
+            wOut = weightsData.wOut
         }
-        if weightsData.bOut.count == pBOut.data.count {
-            pBOut.data = weightsData.bOut
+        if weightsData.bOut.count == bOut.count {
+            bOut = weightsData.bOut
         }
         rebuildInferenceLayout()
     }
@@ -213,7 +199,7 @@ public final class SpikingNetwork: @unchecked Sendable {
         if wRecT.count != hSize * hSize {
             wRecT = [Float](repeating: 0.0, count: hSize * hSize)
         }
-        pWRec.data.withUnsafeBufferPointer { src in
+        wRec.withUnsafeBufferPointer { src in
             wRecT.withUnsafeMutableBufferPointer { dst in
                 var n = 0
                 while n < hSize {
@@ -228,14 +214,14 @@ public final class SpikingNetwork: @unchecked Sendable {
             }
         }
         var l = 0
-        while l < pWLayers.count {
+        while l < wLayers.count {
             if wLayersT.count <= l {
                 wLayersT.append([Float](repeating: 0.0, count: hSize * hSize))
             }
             if wLayersT[l].count != hSize * hSize {
                 wLayersT[l] = [Float](repeating: 0.0, count: hSize * hSize)
             }
-            let srcLayer = pWLayers[l].data
+            let srcLayer = wLayers[l]
             srcLayer.withUnsafeBufferPointer { src in
                 wLayersT[l].withUnsafeMutableBufferPointer { dst in
                     var n = 0
@@ -255,7 +241,7 @@ public final class SpikingNetwork: @unchecked Sendable {
         if wOutT.count != hSize * outputDim {
             wOutT = [Float](repeating: 0.0, count: hSize * outputDim)
         }
-        pWOut.data.withUnsafeBufferPointer { src in
+        wOut.withUnsafeBufferPointer { src in
             wOutT.withUnsafeMutableBufferPointer { dst in
                 var c = 0
                 while c < outputDim {
@@ -271,14 +257,21 @@ public final class SpikingNetwork: @unchecked Sendable {
         }
     }
 
+    /// 1 フレーム分の forward。状態 (v, s, a) を 1 フレーム進め、`readoutSum` に
+    /// **このフレームの閾値単位膜電位の積算** (最終層、内部 timeSteps 回ぶんの合計) を書く。
+    ///
+    /// ロジットは返さない。ロジットは readout に線形なので、読み出し線形層 `wOut` は
+    /// 1 文字あたり 1 回だけ掛ければ足りる (`classifyLogits` を見よ)。
+    /// フレームごとに `wOut` (outputDim x maxHiddenDim) を掛けて softmax まで計算していた
+    /// 旧実装は、分類では捨てられる値を 32 回計算していた (2026-09-25 に削除)。
+    ///
+    /// `readoutSum` は呼び出しのたびにゼロから積み直す (フレームごとの値であって累積ではない)。
     public func forward(
         features: [Float],
         vPrev: inout [Float],
         sPrev: inout [Float],
         aPrev: inout [Float],
         readoutSum: inout [Float],
-        logits: inout [Float],
-        probabilities: inout [Float],
         scratch: ForwardScratch
     ) {
         if features.count < inputDim {
@@ -301,9 +294,9 @@ public final class SpikingNetwork: @unchecked Sendable {
 
         // 2. 入力電流の事前計算 (全タイムステップで不変のためループ外へ Hoist)。
         let hLimit = hSize - (hSize % 8)
-        pWIn.data.withUnsafeBufferPointer { wInBuf in
+        wIn.withUnsafeBufferPointer { wInBuf in
             features.withUnsafeBufferPointer { featBuf in
-                pBH.data.withUnsafeBufferPointer { bhBuf in
+                bH.withUnsafeBufferPointer { bhBuf in
                     scratch.inputCurrents.withUnsafeMutableBufferPointer { curBuf in
                         let wIn = wInBuf.baseAddress!
                         let feat = featBuf.baseAddress!
@@ -444,7 +437,7 @@ public final class SpikingNetwork: @unchecked Sendable {
             }
 
             // 3.2 層 1 以降: 前層スパイクの結合電流を RMSNorm し、前層の入力電流を加算
-            //     (学習側 MLXBPTTTrainer.logitsBatch と同じ式)
+            //     (学習側 MLXClassificationTrainer と同じ式)
             var layerIdx = 1
             while layerIdx < numLayers {
                 let prevLayerOffset = (layerIdx - 1) * hSize
@@ -463,7 +456,7 @@ public final class SpikingNetwork: @unchecked Sendable {
                 }
 
                 // 結合電流 = bHLayers + wLayersT * activeSpikes
-                let bData = pBHLayers[upperIdx].data
+                let bData = bHLayers[upperIdx]
                 let wLayerTData = wLayersT[upperIdx]
                 scratch.stepCurrents.withUnsafeMutableBufferPointer { stepBuf in
                     let step = stepBuf.baseAddress!
@@ -507,7 +500,7 @@ public final class SpikingNetwork: @unchecked Sendable {
                     }
                 }
 
-                let gammaData = pGammaRMS[upperIdx].data
+                let gammaData = gammaRMS[upperIdx]
                 scratch.stepCurrents.withUnsafeMutableBufferPointer { stepBuf in
                     scratch.stepCurrentsPrev.withUnsafeMutableBufferPointer { prevBuf in
                         gammaData.withUnsafeBufferPointer { gammaBuf in
@@ -603,122 +596,8 @@ public final class SpikingNetwork: @unchecked Sendable {
             t += 1
         }
 
-        // 4. 線形層。最終層で積んだ閾値単位膜電位の平均 (学習側 logitsBatch と同じ)
-        let invT = 1.0 / Float(timeSteps)
-        let biasData = pBOut.data
-
-        var activeOutCount = 0
-        var k = 0
-        while k < hSize {
-            let rate = readoutSum[k] * invT
-            if rate != 0.0 {
-                scratch.activeReadoutIndices[activeOutCount] = k
-                scratch.activeRates[activeOutCount] = rate
-                activeOutCount += 1
-            }
-            k += 1
-        }
-
-        // 転置レイアウト wOutT により、有効ニューロン k の重み行 (出力次元方向) が
-        // 連続に並ぶ。集計は k ごとに同じ順序で加算するためスカラー版とビット一致する
-        if scratch.readoutSums.count < outputDim {
-            scratch.readoutSums = [Float](repeating: 0.0, count: outputDim)
-        }
-        let outLimit = outputDim - (outputDim % 8)
-        scratch.readoutSums.withUnsafeMutableBufferPointer { sumBuf in
-            let sums = sumBuf.baseAddress!
-            var c = 0
-            while c < outputDim {
-                sums[c] = 0.0
-                c += 1
-            }
-            wOutT.withUnsafeBufferPointer { outBuf in
-                let outT = outBuf.baseAddress!
-                var a = 0
-                while a < activeOutCount {
-                    let rowOffset = scratch.activeReadoutIndices[a] * outputDim
-                    let rate = SIMD8<Float>(repeating: scratch.activeRates[a])
-                    var c = 0
-                    while c < outLimit {
-                        let acc = SIMD8<Float>(
-                            sums[c+0], sums[c+1], sums[c+2], sums[c+3],
-                            sums[c+4], sums[c+5], sums[c+6], sums[c+7]
-                        )
-                        let w = SIMD8<Float>(
-                            outT[rowOffset+c+0], outT[rowOffset+c+1],
-                            outT[rowOffset+c+2], outT[rowOffset+c+3],
-                            outT[rowOffset+c+4], outT[rowOffset+c+5],
-                            outT[rowOffset+c+6], outT[rowOffset+c+7]
-                        )
-                        let sum = acc + (w * rate)
-                        sums[c+0] = sum[0]
-                        sums[c+1] = sum[1]
-                        sums[c+2] = sum[2]
-                        sums[c+3] = sum[3]
-                        sums[c+4] = sum[4]
-                        sums[c+5] = sum[5]
-                        sums[c+6] = sum[6]
-                        sums[c+7] = sum[7]
-                        c += 8
-                    }
-                    while c < outputDim {
-                        sums[c] += outT[rowOffset + c] * scratch.activeRates[a]
-                        c += 1
-                    }
-                    a += 1
-                }
-            }
-        }
-
-        var maxLogit: Float = -Float.greatestFiniteMagnitude
-        var c = 0
-        while c < outputDim {
-            let logit = biasData[c] + scratch.readoutSums[c]
-            logits[c] = logit
-            if maxLogit < logit {
-                maxLogit = logit
-            }
-            c += 1
-        }
-
-        // 5. Softmax
-        var sumExp: Float = 0.0
-        c = 0
-        while c < outputDim {
-            let expVal = exp(logits[c] - maxLogit)
-            probabilities[c] = expVal
-            sumExp += expVal
-            c += 1
-        }
-        let invSum = 1.0 / sumExp
-        c = 0
-        while c < outputDim {
-            probabilities[c] *= invSum
-            c += 1
-        }
-    }
-
-    /// `aPrev` と `ForwardScratch` を都度確保する版。ストリーミングでは使わない。
-    public func forward(
-        features: [Float],
-        vPrev: inout [Float],
-        sPrev: inout [Float],
-        readoutSum: inout [Float],
-        logits: inout [Float],
-        probabilities: inout [Float]
-    ) {
-        var aPrev = [Float](repeating: 0.0, count: numLayers * maxHiddenDim)
-        let scratch = ForwardScratch(maxHiddenDim: maxHiddenDim)
-        forward(
-            features: features,
-            vPrev: &vPrev,
-            sPrev: &sPrev,
-            aPrev: &aPrev,
-            readoutSum: &readoutSum,
-            logits: &logits,
-            probabilities: &probabilities,
-            scratch: scratch
-        )
+        // 読み出し線形層はここでは掛けない。`classifyLogits` が 32 フレーム分の
+        // `readoutSum` を積んでから 1 回だけ掛ける (ロジットは readout に線形なので同値)。
     }
 
     /// 隠れ層はハードリセット、最終層は閾値単位の膜電位を読んで余りを残す。

@@ -10,6 +10,16 @@ CONFIG := release
 WASM_TOOLCHAIN := 6.2.3
 WASM_SDK := swift-6.2.3-RELEASE_wasm
 WASM_TRIPLE := wasm32-unknown-wasip1
+# wasm の SIMD128 を有効にする target-cpu。
+# 既定 (mvp) では Swift の SIMD8<Float> が 1 命令も v128 にならず全部スカラーに落ちる。
+# 2026-09-25 実測 (kana_R7、node demo/check.mjs --limit 1000、同一負荷で交互に測定):
+#   mvp 29.11 ms/件 -> bleeding-edge 14.31 ms/件 (2.03 倍)、予測は top-1/top-5 とも完全一致、
+#   サイズは 7,642,510 -> 7,644,252 バイト (+1,742)。
+# LLVM の WebAssembly バックエンドが持つ CPU は mvp / generic / bleeding-edge の 3 つだけで、
+# simd128 だけを選ぶ手段が無い。bleeding-edge は simd128 のほかに atomics と tail-call も使うため、
+# デモに必要なブラウザが Chrome 112+ / Firefox 121+ / Safari 18.2+ に上がる。
+# 元に戻すときは mvp にする (wasm-opt の --enable-simd は付けたままで害はない)。
+WASM_CPU := bleeding-edge
 DEMO_DIR := .tmp/demo
 DEMO_PORT := 8080
 
@@ -59,9 +69,9 @@ recognize:
 
 ## SwiftWasm SDK で wasm をビルドし、wasm-opt -Oz をかけて $(DEMO_DIR) に置く
 wasm:
-	swiftly run +$(WASM_TOOLCHAIN) swift build -c $(CONFIG) --swift-sdk $(WASM_SDK) --product SpiketegakiWASM
+	swiftly run +$(WASM_TOOLCHAIN) swift build -c $(CONFIG) --swift-sdk $(WASM_SDK) --product SpiketegakiWASM -Xswiftc -target-cpu -Xswiftc $(WASM_CPU)
 	@mkdir -p $(DEMO_DIR)
-	wasm-opt -Oz --strip-debug -o $(DEMO_DIR)/spiketegaki.wasm .build/$(WASM_TRIPLE)/$(CONFIG)/SpiketegakiWASM.wasm
+	wasm-opt -Oz --strip-debug --enable-simd -o $(DEMO_DIR)/spiketegaki.wasm .build/$(WASM_TRIPLE)/$(CONFIG)/SpiketegakiWASM.wasm
 	@ls -l .build/$(WASM_TRIPLE)/$(CONFIG)/SpiketegakiWASM.wasm $(DEMO_DIR)/spiketegaki.wasm
 
 ## デモ一式を $(DEMO_DIR) に置いて http://localhost:$(DEMO_PORT)/ で配信する

@@ -62,12 +62,13 @@ final class DatasetFileTests: XCTestCase {
         defer { reader.close() }
         XCTAssertEqual(reader.count, 3)
 
-        let all = try reader.readAll()
-        XCTAssertEqual(all.count, 3)
-        for (i, sample) in all.enumerated() {
+        var i = 0
+        while i < 3 {
+            let sample = try reader.sample(at: i)
             XCTAssertEqual(sample.label, labels[i])
             XCTAssertEqual(sample.image.asUInt8(), images[i].asUInt8(), "サンプル \(i) の画素が違う")
             XCTAssertEqual(sample.image.pixels, images[i].pixels, "サンプル \(i) の画素が違う")
+            i += 1
         }
     }
 
@@ -83,15 +84,12 @@ final class DatasetFileTests: XCTestCase {
 
         let reader = try DatasetReader(url: file)
         defer { reader.close() }
-        let all = try reader.readAll()
-        // 逆順・飛び飛びで引いても同じ
+        // 逆順・飛び飛びで引いても、書いた順のラベル・画素がそのまま返る
         for index in [6, 0, 3, 5, 1, 4, 2] {
             let s = try reader.sample(at: index)
-            XCTAssertEqual(s.label, all[index].label)
-            XCTAssertEqual(s.image.pixels, all[index].image.pixels)
+            XCTAssertEqual(s.label, index * 100)
+            XCTAssertEqual(s.image.pixels, try makeImage(index).pixels)
         }
-        // ランダムアクセスの後でも readAll は先頭から読み直す
-        XCTAssertEqual(try reader.readAll().map { $0.label }, all.map { $0.label })
     }
 
     func testDatasetSampleAppendOverload() throws {
@@ -169,7 +167,6 @@ final class DatasetFileTests: XCTestCase {
         let reader = try DatasetReader(url: file)
         defer { reader.close() }
         XCTAssertEqual(reader.count, 0)
-        XCTAssertEqual(try reader.readAll().count, 0)
         XCTAssertThrowsError(try reader.sample(at: 0)) { error in
             XCTAssertEqual(error as? DatasetFileError, .indexOutOfRange(index: 0, count: 0))
         }
@@ -317,11 +314,7 @@ final class DatasetFileTests: XCTestCase {
         defer { reader.close() }
         XCTAssertEqual(reader.count, 1)
 
-        // ランダムアクセスと全読み込みの両方で投げること
         XCTAssertThrowsError(try reader.sample(at: 0)) { error in
-            XCTAssertEqual(error as? DatasetFileError, .invalidLabel(65535))
-        }
-        XCTAssertThrowsError(try reader.readAll()) { error in
             XCTAssertEqual(error as? DatasetFileError, .invalidLabel(65535))
         }
     }
@@ -358,7 +351,7 @@ final class DatasetFileTests: XCTestCase {
         defer { goodReader.close() }
         let sample = try goodReader.sample(at: 0)
         XCTAssertEqual(sample.label, n - 1)
-        XCTAssertEqual(try goodReader.readAll().count, 1)
+        XCTAssertEqual(goodReader.count, 1)
     }
 
     func testIndexOutOfRangeThrows() throws {
@@ -384,7 +377,6 @@ final class DatasetFileTests: XCTestCase {
         let reader = try DatasetReader(url: file)
         reader.close()
         XCTAssertThrowsError(try reader.sample(at: 0))
-        XCTAssertThrowsError(try reader.readAll())
     }
 
     // MARK: - メタ JSON
@@ -432,6 +424,11 @@ final class DatasetFileTests: XCTestCase {
         XCTAssertEqual(reader.count, 500)
         XCTAssertEqual(try reader.sample(at: 499).label, 499)
         XCTAssertEqual(try reader.sample(at: 0).image.asUInt8(), try makeImage(0).asUInt8())
-        XCTAssertEqual(try reader.readAll().count, 500)
+        // 全件を順に引ける (ストリーミング書き込みの結果が最後まで読めること)
+        var r = 0
+        while r < 500 {
+            XCTAssertEqual(try reader.sample(at: r).label, r % CharacterVocabulary.shared.count)
+            r += 1
+        }
     }
 }

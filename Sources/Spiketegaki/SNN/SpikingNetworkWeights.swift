@@ -6,7 +6,6 @@ public struct SpikingNetworkWeights: Sendable, Codable, Equatable {
     public let timeSteps: Int
     public let beta: Float
     public let vTh: Float
-    public let vReset: Float
     public let alpha: Float
     public let rho: Float      // 適応閾値減衰率
     public let gamma: Float    // 発火時閾値上昇幅 (0.0 で固定閾値)
@@ -60,7 +59,6 @@ public struct SpikingNetworkWeights: Sendable, Codable, Equatable {
         self.timeSteps = timeSteps
         self.beta = lifConfig.beta
         self.vTh = lifConfig.vTh
-        self.vReset = lifConfig.vReset
         self.alpha = lifConfig.alpha
         self.rho = lifConfig.rho
         self.gamma = lifConfig.gamma
@@ -81,7 +79,7 @@ public struct SpikingNetworkWeights: Sendable, Codable, Equatable {
 
     private enum CodingKeys: String, CodingKey {
         case inputDim, maxHiddenDim, outputDim, timeSteps
-        case beta, vTh, vReset, alpha, rho, gamma
+        case beta, vTh, alpha, rho, gamma
         case wIn, wRec, bH
         case wLayers, bHLayers, gammaRMS
         case wOut, bOut
@@ -98,7 +96,6 @@ public struct SpikingNetworkWeights: Sendable, Codable, Equatable {
         self.timeSteps = try c.decode(Int.self, forKey: .timeSteps)
         self.beta = try c.decode(Float.self, forKey: .beta)
         self.vTh = try c.decode(Float.self, forKey: .vTh)
-        self.vReset = try c.decode(Float.self, forKey: .vReset)
         self.alpha = try c.decode(Float.self, forKey: .alpha)
         self.rho = try c.decode(Float.self, forKey: .rho)
         self.gamma = try c.decode(Float.self, forKey: .gamma)
@@ -126,7 +123,6 @@ public struct SpikingNetworkWeights: Sendable, Codable, Equatable {
         return LIFConfig(
             beta: beta,
             vTh: vTh,
-            vReset: vReset,
             alpha: alpha,
             rho: rho,
             gamma: gamma

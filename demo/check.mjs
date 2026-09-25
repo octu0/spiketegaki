@@ -17,7 +17,9 @@ import { WASI } from 'node:wasi';
 const WASM_PATH = '.tmp/demo/spiketegaki.wasm';
 const WEIGHTS_PATH = '.tmp/demo/kana.stgw';
 const DATASET_PATH = '.tmp/datasets/kana_eval.stgk';
-const JSON_WEIGHTS_PATH = '.tmp/weights/kana_R7.json';
+// kana.stgw の書き出し元と同じ JSON でなければ 3 段一致 (MLX → CPU → wasm) の
+// 検証にならないので、--export-weights に渡した JSON をここに合わせる。
+const JSON_WEIGHTS_PATH = '.tmp/weights/kana_R11.json';
 
 const STGK_HEADER = 16;
 const STGK_PIXELS = 32 * 32;
@@ -235,21 +237,25 @@ async function main() {
     console.log('-- CPU との照合はスキップ (--skip-cpu) --');
   }
 
-  // 手描き相当の合成入力 (256x256 のマス目、線幅 256/32*1.5 = 12)
+  // 手描き相当の合成入力 (256x256 のマス目)。
+  // 線幅は 32x32 換算で 1.5px (= 12) と 2.5px (= 20) の 2 通り。
+  // 手書きはフォントより線が太いので、太い側でも壊れないことを見る。
   const size = 256;
-  const width = (size / SIDE) * 1.5;
+  const widths = [(size / SIDE) * 1.5, (size / SIDE) * 2.5];
   const shapes = {
     '横棒 (一 のつもり)': [[40, 128, 216, 128]],
     'L 字': [[70, 40, 70, 210], [70, 210, 200, 210]],
     '縦棒': [[128, 30, 128, 226]]
   };
-  console.log('');
-  console.log(`-- 合成入力 (${size}x${size}、線幅 ${width}) の top-5 --`);
-  for (const [name, segs] of Object.entries(shapes)) {
-    const gray = strokeCanvas(size, segs, width);
-    const { top, micros } = classify(ctx, gray, size, size);
-    const list = top.map((t) => `${t.char}(${t.probability.toFixed(3)})`).join(' ');
-    console.log(`  ${name}: ${list}   ${(micros / 1000).toFixed(2)} ms`);
+  for (const width of widths) {
+    console.log('');
+    console.log(`-- 合成入力 (${size}x${size}、線幅 ${width} = 32x32 換算 ${width / (size / SIDE)}px) の top-5 --`);
+    for (const [name, segs] of Object.entries(shapes)) {
+      const gray = strokeCanvas(size, segs, width);
+      const { top, micros } = classify(ctx, gray, size, size);
+      const list = top.map((t) => `${t.char}(${t.probability.toFixed(3)})`).join(' ');
+      console.log(`  ${name}: ${list}   ${(micros / 1000).toFixed(2)} ms`);
+    }
   }
 
   // 最後の合成入力の 32x32 正規化結果 (stg_last_normalized の動作確認)

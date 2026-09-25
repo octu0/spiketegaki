@@ -11,6 +11,9 @@
 ///
 /// 線を太らせる変形だけを持ち、細らせる変形は持たない。線の細さのばらつきは
 /// フォントのウェイト違い (Light / Thin など) で賄う。
+///
+/// 膨張は 1〜2px の等確率で、確率 0.6 で起きる (2026-09-25 に 1px / 確率 1/3 から強化)。
+/// 手書きの線はキャンバス上で 32px 換算 2〜3px と太く、フォントの 1〜1.5px より太いため。
 public final class Augmenter: @unchecked Sendable {
     /// 拡張パラメータ。
     public struct Parameters: Sendable, Equatable {
@@ -18,12 +21,14 @@ public final class Augmenter: @unchecked Sendable {
         public var shearRange: ClosedRange<Float>
         /// 回転: -10°〜10°
         public var rotationDegreesRange: ClosedRange<Float>
-        /// 平行移動: ±2px
+        /// 平行移動: ±5px
         public var translationRange: ClosedRange<Float>
-        /// 拡縮: 0.85〜1.1
+        /// 拡縮: 0.7〜1.15
         public var scaleRange: ClosedRange<Float>
         /// 太さ: この確率で膨張する (残りは変化なし)
         public var thicknessProbability: Float
+        /// 太さ: 膨張する場合の最大 px 数。1〜この値の等確率で選ぶ
+        public var maxDilationPixels: Int
         /// 弾性変形の振幅 (px)
         public var elasticAmplitude: Float
         /// 弾性変形の変位場をぼかすガウスの σ
@@ -36,9 +41,10 @@ public final class Augmenter: @unchecked Sendable {
         public init(
             shearRange: ClosedRange<Float> = -0.3 ... 0.3,
             rotationDegreesRange: ClosedRange<Float> = -10.0 ... 10.0,
-            translationRange: ClosedRange<Float> = -2.0 ... 2.0,
-            scaleRange: ClosedRange<Float> = 0.85 ... 1.1,
-            thicknessProbability: Float = 1.0 / 3.0,
+            translationRange: ClosedRange<Float> = -5.0 ... 5.0,
+            scaleRange: ClosedRange<Float> = 0.7 ... 1.15,
+            thicknessProbability: Float = 0.6,
+            maxDilationPixels: Int = 2,
             elasticAmplitude: Float = 1.5,
             elasticSigma: Float = 4.0,
             gaussianNoiseSigma: Float = 0.05,
@@ -49,6 +55,7 @@ public final class Augmenter: @unchecked Sendable {
             self.translationRange = translationRange
             self.scaleRange = scaleRange
             self.thicknessProbability = thicknessProbability
+            self.maxDilationPixels = maxDilationPixels
             self.elasticAmplitude = elasticAmplitude
             self.elasticSigma = elasticSigma
             self.gaussianNoiseSigma = gaussianNoiseSigma
@@ -63,11 +70,6 @@ public final class Augmenter: @unchecked Sendable {
     public init(seed: UInt64, parameters: Parameters = Parameters()) {
         self.parameters = parameters
         self.rngState = seed == 0 ? 0x9E3779B97F4A7C15 : seed
-    }
-
-    /// 乱数系列を初期状態に戻す。
-    public func reseed(_ seed: UInt64) {
-        rngState = seed == 0 ? 0x9E3779B97F4A7C15 : seed
     }
 
     // MARK: - 拡張全体
@@ -89,10 +91,19 @@ public final class Augmenter: @unchecked Sendable {
             dy: dy
         )
 
-        // 太さ: 膨張 / 変化なし
+        // 太さ: 確率 thicknessProbability で膨張する。膨張量は 1〜maxDilationPixels px の等確率。
+        // 乱数は 1 個だけ引き、その値を等幅の区画に割って px 数に読み替える
+        // (確率と px 数で 2 個引くと、太さを変えたときに以降の乱数系列がずれる)。
         let thickness = nextFloat01()
-        if thickness < parameters.thicknessProbability {
-            out = dilate(out)
+        if parameters.maxDilationPixels > 0 && thickness < parameters.thicknessProbability {
+            let step = parameters.thicknessProbability / Float(parameters.maxDilationPixels)
+            var pixels = Int(thickness / step) + 1
+            if pixels > parameters.maxDilationPixels { pixels = parameters.maxDilationPixels }
+            var k = 0
+            while k < pixels {
+                out = dilate(out)
+                k += 1
+            }
         }
 
         out = elasticDeform(
@@ -114,27 +125,7 @@ public final class Augmenter: @unchecked Sendable {
         return (try? CharacterImage(pixels: image.pixels)) ?? CharacterImage()
     }
 
-    // MARK: - 個別のアフィン変形 (逆写像 + 双一次補間)
-
-    /// 水平せん断。`amount` は 1px 下がるごとに右へずれる量。
-    public func shear(_ image: CharacterImage, amount: Float) -> CharacterImage {
-        return affine(image, shear: amount, rotationDegrees: 0.0, scale: 1.0, dx: 0.0, dy: 0.0)
-    }
-
-    /// 画像中心まわりの回転 (度)。
-    public func rotate(_ image: CharacterImage, degrees: Float) -> CharacterImage {
-        return affine(image, shear: 0.0, rotationDegrees: degrees, scale: 1.0, dx: 0.0, dy: 0.0)
-    }
-
-    /// 平行移動 (px)。
-    public func translate(_ image: CharacterImage, dx: Float, dy: Float) -> CharacterImage {
-        return affine(image, shear: 0.0, rotationDegrees: 0.0, scale: 1.0, dx: dx, dy: dy)
-    }
-
-    /// 画像中心まわりの拡縮。
-    public func scale(_ image: CharacterImage, factor: Float) -> CharacterImage {
-        return affine(image, shear: 0.0, rotationDegrees: 0.0, scale: factor, dx: 0.0, dy: 0.0)
-    }
+    // MARK: - アフィン変形 (逆写像 + 双一次補間)
 
     /// せん断 → 回転 → 拡縮 → 平行移動 を 1 枚の行列にまとめて掛ける。
     /// 再サンプルが 1 回で済むので、個別に 4 回掛けるよりぼけない。
@@ -190,7 +181,7 @@ public final class Augmenter: @unchecked Sendable {
         return (try? CharacterImage(pixels: out)) ?? CharacterImage()
     }
 
-    // MARK: - 太さ (3x3 最大値フィルタ = 1px の膨張)
+    // MARK: - 太さ (3x3 最大値フィルタ = 1px の膨張。2px は 2 回掛ける)
 
     /// 1px 膨張 (3x3 最大値)。画像外は紙 (0) なので墨は減らない。
     public func dilate(_ image: CharacterImage) -> CharacterImage {

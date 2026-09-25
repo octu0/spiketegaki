@@ -103,15 +103,6 @@ final class AugmenterTests: XCTestCase {
         XCTAssertNotEqual(a.pixels, b.pixels, "seed 1 と 2 の出力が同じ")
     }
 
-    func testReseedRestartsTheSequence() throws {
-        let image = try sampleImage()
-        let aug = Augmenter(seed: 999)
-        let first = aug.augment(image)
-        _ = aug.augment(image)
-        aug.reseed(999)
-        XCTAssertEqual(aug.augment(image).pixels, first.pixels)
-    }
-
     func testSeedZeroDoesNotFreezeTheGenerator() {
         let aug = Augmenter(seed: 0)
         var seen = Set<UInt64>()
@@ -154,10 +145,10 @@ final class AugmenterTests: XCTestCase {
         let image = try sampleImage()
         let aug = Augmenter(seed: 42)
         let cases: [(String, CharacterImage)] = [
-            ("shear 0", aug.shear(image, amount: 0.0)),
-            ("rotate 0", aug.rotate(image, degrees: 0.0)),
-            ("translate 0", aug.translate(image, dx: 0.0, dy: 0.0)),
-            ("scale 1", aug.scale(image, factor: 1.0)),
+            ("shear 0", aug.affine(image, shear: 0.0, rotationDegrees: 0.0, scale: 1.0, dx: 0.0, dy: 0.0)),
+            ("rotate 0", aug.affine(image, shear: 0.0, rotationDegrees: 0.0, scale: 1.0, dx: 0.0, dy: 0.0)),
+            ("translate 0", aug.affine(image, shear: 0.0, rotationDegrees: 0.0, scale: 1.0, dx: 0.0, dy: 0.0)),
+            ("scale 1", aug.affine(image, shear: 0.0, rotationDegrees: 0.0, scale: 1.0, dx: 0.0, dy: 0.0)),
             ("affine identity", aug.affine(image, shear: 0.0, rotationDegrees: 0.0, scale: 1.0, dx: 0.0, dy: 0.0))
         ]
         for (name, out) in cases {
@@ -172,9 +163,28 @@ final class AugmenterTests: XCTestCase {
     func testDegenerateScaleDoesNotCrash() throws {
         let image = try sampleImage()
         let aug = Augmenter(seed: 1)
-        let out = aug.scale(image, factor: 0.0)
+        let out = aug.affine(image, shear: 0.0, rotationDegrees: 0.0, scale: 0.0, dx: 0.0, dy: 0.0)
         assertValid(out, "scale 0")
         XCTAssertEqual(out.inkSum, 0.0)
+    }
+
+    // MARK: - 既定のパラメータ
+
+    /// 既定値は設計書 §7 の拡張範囲と一致する。
+    /// 平行移動 ±5px・拡縮 0.7〜1.15 は 2026-09-25 に ±2px / 0.85〜1.1 から広げたもの。
+    /// 膨張 1〜2px (等確率) / 確率 0.6 も 2026-09-25 に 1px / 確率 1/3 から強化したもの。
+    func testDefaultParametersMatchTheDesignedRanges() {
+        let p = Augmenter.Parameters()
+        XCTAssertEqual(p.shearRange, -0.3 ... 0.3)
+        XCTAssertEqual(p.rotationDegreesRange, -10.0 ... 10.0)
+        XCTAssertEqual(p.translationRange, -5.0 ... 5.0, "平行移動は ±5px")
+        XCTAssertEqual(p.scaleRange, 0.7 ... 1.15, "拡縮は 0.7〜1.15")
+        XCTAssertEqual(p.thicknessProbability, 0.6, accuracy: 1e-7, "膨張の確率は 0.6")
+        XCTAssertEqual(p.maxDilationPixels, 2, "膨張は 1〜2px の等確率")
+        XCTAssertEqual(p.elasticAmplitude, 1.5)
+        XCTAssertEqual(p.elasticSigma, 4.0)
+        XCTAssertEqual(p.gaussianNoiseSigma, 0.05)
+        XCTAssertEqual(p.saltPepperProbability, 0.01)
     }
 
     // MARK: - アフィン変形の性質
@@ -184,7 +194,7 @@ final class AugmenterTests: XCTestCase {
         p[16 * CharacterImage.side + 16] = 1.0
         let image = try CharacterImage(pixels: p)
         let aug = Augmenter(seed: 1)
-        let out = aug.translate(image, dx: 3.0, dy: -2.0)
+        let out = aug.affine(image, shear: 0.0, rotationDegrees: 0.0, scale: 1.0, dx: 3.0, dy: -2.0)
         XCTAssertEqual(out[19, 14], 1.0, accuracy: 1e-5, "+3, -2 の平行移動になっていない")
         XCTAssertEqual(out[16, 16], 0.0, accuracy: 1e-5)
         assertValid(out)
@@ -197,7 +207,7 @@ final class AugmenterTests: XCTestCase {
         var out = image
         var i = 0
         while i < 4 {
-            out = aug.rotate(out, degrees: 90.0)
+            out = aug.affine(out, shear: 0.0, rotationDegrees: 90.0, scale: 1.0, dx: 0.0, dy: 0.0)
             i += 1
         }
         XCTAssertEqual(out.inkSum, image.inkSum, accuracy: image.inkSum * 0.02, "90 度 x4 で墨の量が大きく変わった")
@@ -208,13 +218,13 @@ final class AugmenterTests: XCTestCase {
         let image = try sampleImage()
         let aug = Augmenter(seed: 3)
         for amount in [Float(-0.3), -0.15, 0.15, 0.3] {
-            assertValid(aug.shear(image, amount: amount), "shear \(amount)")
+            assertValid(aug.affine(image, shear: amount, rotationDegrees: 0.0, scale: 1.0, dx: 0.0, dy: 0.0), "shear \(amount)")
         }
         for degrees in [Float(-10), -5, 5, 10] {
-            assertValid(aug.rotate(image, degrees: degrees), "rotate \(degrees)")
+            assertValid(aug.affine(image, shear: 0.0, rotationDegrees: degrees, scale: 1.0, dx: 0.0, dy: 0.0), "rotate \(degrees)")
         }
-        for factor in [Float(0.85), 1.0, 1.1] {
-            assertValid(aug.scale(image, factor: factor), "scale \(factor)")
+        for factor in [Float(0.7), 1.0, 1.15] {
+            assertValid(aug.affine(image, shear: 0.0, rotationDegrees: 0.0, scale: factor, dx: 0.0, dy: 0.0), "scale \(factor)")
         }
     }
 
@@ -396,9 +406,11 @@ final class AugmenterTests: XCTestCase {
         var i = 0
         while i < 100 {
             let out = aug.augment(small)
-            // 拡縮は最大 1.1 倍、弾性 1.5px なので、墨の量が元の 2 倍を超えることはない。
-            // 外接矩形で正規化していたら枠いっぱい (16 倍近く) になる。
-            XCTAssertLessThan(out.inkSum, small.inkSum * 2.0,
+            // 拡縮は最大 1.15 倍、膨張は最大 2px、弾性 1.5px なので、8x8 の四角の墨が
+            // 元の 3.5 倍を超えることはない (同条件 20000 回の実測で最大 3.049)。
+            // 外接矩形で正規化していたら枠いっぱい (16 倍近く) になるので、3.5 でも分離は十分。
+            // 上限は 2026-09-25 に膨張を 1px → 1〜2px にした際に 3.0 から引き上げた。
+            XCTAssertLessThan(out.inkSum, small.inkSum * 3.5,
                               "\(i) 回目に墨が増えすぎ (外接矩形へ引き伸ばされている疑い)")
             i += 1
         }
@@ -429,7 +441,8 @@ final class AugmenterTests: XCTestCase {
             rotationDegreesRange: 0.0 ... 0.0,
             translationRange: 0.0 ... 0.0,
             scaleRange: 1.0 ... 1.0,
-            thicknessProbability: 1.0 / 3.0,
+            thicknessProbability: 0.6,
+            maxDilationPixels: 2,
             elasticAmplitude: 0.0,
             elasticSigma: 4.0,
             gaussianNoiseSigma: 0.0,
@@ -450,6 +463,58 @@ final class AugmenterTests: XCTestCase {
         // 膨張自体は起きていること (太さの拡張がまるごと死んでいない)
         XCTAssertGreaterThan(thicker, 0, "膨張が 1 度も起きていない")
         XCTAssertLessThan(thicker, 300, "毎回膨張している (確率が効いていない)")
+    }
+
+    /// 膨張は 1〜2px の等確率で、確率 `thicknessProbability` で起きる。
+    ///
+    /// 太さ以外をすべて止めて中央の 1 画素だけを入れると、出力の墨は
+    /// 膨張なし = 1、1px 膨張 = 3x3 = 9、2px 膨張 = 5x5 = 25 のいずれかになる。
+    /// この 3 通りの頻度で、確率 0.6 と 1px:2px = 1:1 を確かめる。
+    func testDilationIsOneOrTwoPixelsWithEqualProbability() throws {
+        var p = [Float](repeating: 0.0, count: CharacterImage.pixelCount)
+        p[16 * CharacterImage.side + 16] = 1.0
+        let dot = try CharacterImage(pixels: p)
+
+        // 太さ以外をすべて止める (アフィンは恒等、弾性・ノイズ無し)
+        let params = Augmenter.Parameters(
+            shearRange: 0.0 ... 0.0,
+            rotationDegreesRange: 0.0 ... 0.0,
+            translationRange: 0.0 ... 0.0,
+            scaleRange: 1.0 ... 1.0,
+            thicknessProbability: 0.6,
+            maxDilationPixels: 2,
+            elasticAmplitude: 0.0,
+            elasticSigma: 4.0,
+            gaussianNoiseSigma: 0.0,
+            saltPepperProbability: 0.0
+        )
+        let aug = Augmenter(seed: 987654321, parameters: params)
+
+        let trials = 20000
+        var none = 0
+        var one = 0
+        var two = 0
+        var i = 0
+        while i < trials {
+            let ink = aug.augment(dot).inkSum
+            if ink < 4.0 {
+                none += 1
+            } else if ink < 16.0 {
+                one += 1
+            } else {
+                two += 1
+            }
+            i += 1
+        }
+        XCTAssertEqual(none + one + two, trials, "3 通り以外の墨量が出た")
+
+        // 二項分布の標準偏差は 20000 件で約 0.35% なので、±2% はきわめて広い許容
+        let pNone = Float(none) / Float(trials)
+        let pOne = Float(one) / Float(trials)
+        let pTwo = Float(two) / Float(trials)
+        XCTAssertEqual(pNone, 0.4, accuracy: 0.02, "膨張しない確率が 0.4 でない")
+        XCTAssertEqual(pOne, 0.3, accuracy: 0.02, "1px 膨張の確率が 0.3 でない")
+        XCTAssertEqual(pTwo, 0.3, accuracy: 0.02, "2px 膨張の確率が 0.3 でない")
     }
 
     /// 細い小さな字でも `augment` がほぼ真っ白な画像を作らないこと。

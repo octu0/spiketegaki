@@ -17,11 +17,10 @@
 //    32     4  labelCount     u32  (0xFFFFFFFF = classLabels が nil)
 //    36     4  beta           f32
 //    40     4  vTh            f32
-//    44     4  vReset         f32
-//    48     4  alpha          f32
-//    52     4  rho            f32
-//    56     4  gamma          f32
-//    60     4  reserved       u32  (= 0)
+//    44     4  alpha          f32
+//    48     4  rho            f32
+//    52     4  gamma          f32
+//    56     8  reserved       (= 0)
 //    64        ここから float32 の本体
 //
 //   wIn      maxHiddenDim * inputDim
@@ -90,10 +89,10 @@ extension SpikingNetworkWeights {
         }
         binaryPutF32(&out, beta)
         binaryPutF32(&out, vTh)
-        binaryPutF32(&out, vReset)
         binaryPutF32(&out, alpha)
         binaryPutF32(&out, rho)
         binaryPutF32(&out, gamma)
+        binaryPutU32(&out, 0)   // reserved
         binaryPutU32(&out, 0)   // reserved
 
         binaryPutFloats(&out, wIn)
@@ -183,10 +182,9 @@ extension SpikingNetworkWeights {
         let lif = LIFConfig(
             beta: binaryGetF32(bytes, 36),
             vTh: binaryGetF32(bytes, 40),
-            vReset: binaryGetF32(bytes, 44),
-            alpha: binaryGetF32(bytes, 48),
-            rho: binaryGetF32(bytes, 52),
-            gamma: binaryGetF32(bytes, 56)
+            alpha: binaryGetF32(bytes, 44),
+            rho: binaryGetF32(bytes, 48),
+            gamma: binaryGetF32(bytes, 52)
         )
 
         // 次元から決まる float 総数とバイト長

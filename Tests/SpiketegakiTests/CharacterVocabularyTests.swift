@@ -4,6 +4,27 @@ import XCTest
 final class CharacterVocabularyTests: XCTestCase {
     private let vocab = CharacterVocabulary.shared
 
+    /// 文字 → index の逆引き。推論・学習の経路は index → 文字しか使わないので、
+    /// 語彙の中身を確かめるためのこの表はテスト側で組む。
+    private let indexByCharacter: [Character: Int] = {
+        var table = [Character: Int](minimumCapacity: CharacterVocabulary.shared.count)
+        var i = 0
+        let all = CharacterVocabulary.shared.allCharacters
+        while i < all.count {
+            table[all[i]] = i
+            i += 1
+        }
+        return table
+    }()
+
+    /// 文字の区分。語彙に無ければ nil。
+    private func category(of character: Character) -> ScriptCategory? {
+        guard let i = indexByCharacter[character] else {
+            return nil
+        }
+        return vocab.category(of: i)
+    }
+
     // MARK: - 総数と区分ごとの件数
 
     func testTotalCount() {
@@ -48,17 +69,17 @@ final class CharacterVocabularyTests: XCTestCase {
     // MARK: - 個々の文字
 
     func testDigitsStartAtIndexZero() {
-        XCTAssertEqual(vocab.index(of: "0"), 0)
+        XCTAssertEqual(indexByCharacter["0"], 0)
         XCTAssertEqual(vocab.character(at: 0), "0")
-        XCTAssertEqual(vocab.index(of: "9"), 9)
+        XCTAssertEqual(indexByCharacter["9"], 9)
         XCTAssertEqual(vocab.category(of: 0), .digits)
-        XCTAssertEqual(vocab.category(of: "5"), .digits)
+        XCTAssertEqual(category(of: "5"), .digits)
     }
 
     func testTildeIsAnAsciiSymbol() {
-        let i = try? XCTUnwrap(vocab.index(of: "~"))
+        let i = try? XCTUnwrap(indexByCharacter["~"])
         XCTAssertNotNil(i)
-        XCTAssertEqual(vocab.category(of: "~"), .asciiSymbols)
+        XCTAssertEqual(category(of: "~"), .asciiSymbols)
         // ascii-symbols の末尾が "~"
         let r = vocab.range(of: .asciiSymbols)
         XCTAssertEqual(vocab.character(at: r.upperBound - 1), "~")
@@ -66,20 +87,20 @@ final class CharacterVocabularyTests: XCTestCase {
     }
 
     func testLatinCategories() {
-        XCTAssertEqual(vocab.category(of: "A"), .latinUpper)
-        XCTAssertEqual(vocab.category(of: "Z"), .latinUpper)
-        XCTAssertEqual(vocab.category(of: "a"), .latinLower)
-        XCTAssertEqual(vocab.category(of: "z"), .latinLower)
-        XCTAssertNotEqual(vocab.index(of: "A"), vocab.index(of: "a"))
+        XCTAssertEqual(category(of: "A"), .latinUpper)
+        XCTAssertEqual(category(of: "Z"), .latinUpper)
+        XCTAssertEqual(category(of: "a"), .latinLower)
+        XCTAssertEqual(category(of: "z"), .latinLower)
+        XCTAssertNotEqual(indexByCharacter["A"], indexByCharacter["a"])
     }
 
     func testHiraganaAndKatakana() {
-        XCTAssertEqual(vocab.category(of: "あ"), .hiragana)
-        XCTAssertEqual(vocab.category(of: "ぁ"), .hiragana)
-        XCTAssertEqual(vocab.category(of: "ゖ"), .hiragana)
-        XCTAssertEqual(vocab.category(of: "ア"), .katakana)
+        XCTAssertEqual(category(of: "あ"), .hiragana)
+        XCTAssertEqual(category(of: "ぁ"), .hiragana)
+        XCTAssertEqual(category(of: "ゖ"), .hiragana)
+        XCTAssertEqual(category(of: "ア"), .katakana)
         // 長音符 (U+30FC) は katakana に入れる
-        XCTAssertEqual(vocab.category(of: "ー"), .katakana)
+        XCTAssertEqual(category(of: "ー"), .katakana)
         let k = vocab.range(of: .katakana)
         XCTAssertEqual(vocab.character(at: k.lowerBound), "ァ")
         XCTAssertEqual(vocab.character(at: k.upperBound - 1), "ー")
@@ -94,14 +115,14 @@ final class CharacterVocabularyTests: XCTestCase {
         XCTAssertEqual(vocab.character(at: r.lowerBound), "亜")
         XCTAssertEqual(vocab.character(at: r.upperBound - 1), "腕")
         XCTAssertEqual(vocab.character(at: vocab.count - 1), "腕")
-        XCTAssertEqual(vocab.category(of: "亜"), .kanjiLevel1)
-        XCTAssertEqual(vocab.category(of: "腕"), .kanjiLevel1)
+        XCTAssertEqual(category(of: "亜"), .kanjiLevel1)
+        XCTAssertEqual(category(of: "腕"), .kanjiLevel1)
     }
 
     func testSomeWellKnownKanjiArePresent() {
         for c: Character in ["日", "本", "語", "一", "人", "手", "書", "認", "識", "文", "字"] {
-            XCTAssertNotNil(vocab.index(of: c), "\(c) が語彙に無い")
-            XCTAssertEqual(vocab.category(of: c), .kanjiLevel1, "\(c) が kanjiLevel1 でない")
+            XCTAssertNotNil(indexByCharacter[c], "\(c) が語彙に無い")
+            XCTAssertEqual(category(of: c), .kanjiLevel1, "\(c) が kanjiLevel1 でない")
         }
     }
 
@@ -116,7 +137,7 @@ final class CharacterVocabularyTests: XCTestCase {
         var i = 0
         while i < vocab.count {
             let c = vocab.character(at: i)
-            XCTAssertEqual(vocab.index(of: c), i, "index \(i) (\(c)) の往復が壊れている")
+            XCTAssertEqual(indexByCharacter[c], i, "index \(i) (\(c)) の往復が壊れている")
             i += 1
         }
     }
@@ -141,17 +162,17 @@ final class CharacterVocabularyTests: XCTestCase {
 
     func testExcludedCharacters() {
         // 空白は含めない
-        XCTAssertNil(vocab.index(of: " "))
-        XCTAssertNil(vocab.index(of: "　"))  // 全角空白
-        XCTAssertNil(vocab.index(of: "\n"))
+        XCTAssertNil(indexByCharacter[" "])
+        XCTAssertNil(indexByCharacter["　"])  // 全角空白
+        XCTAssertNil(indexByCharacter["\n"])
         // 第二水準の漢字 (JIS 区 48 以降) は含めない
-        XCTAssertNil(vocab.index(of: "弌"), "第二水準の \"弌\" が入っている")
-        XCTAssertNil(vocab.index(of: "鎔"), "第二水準の \"鎔\" が入っている")
+        XCTAssertNil(indexByCharacter["弌"], "第二水準の \"弌\" が入っている")
+        XCTAssertNil(indexByCharacter["鎔"], "第二水準の \"鎔\" が入っている")
         // JIS 記号 (区 1-2) も含めない
-        XCTAssertNil(vocab.index(of: "、"))
-        XCTAssertNil(vocab.index(of: "○"))
+        XCTAssertNil(indexByCharacter["、"])
+        XCTAssertNil(indexByCharacter["○"])
         // 濁点付き平仮名は U+3041-U+3096 の範囲内なので含まれる
-        XCTAssertNotNil(vocab.index(of: "が"))
+        XCTAssertNotNil(indexByCharacter["が"])
     }
 
     // MARK: - 生成済みテーブルの妥当性
@@ -263,7 +284,7 @@ final class CharacterVocabularyTests: XCTestCase {
         XCTAssertGreaterThanOrEqual(table.count, 12)
 
         for (character, expectedIndex) in table {
-            XCTAssertEqual(vocab.index(of: character), expectedIndex, "index(of: \"\(character)\") が違う")
+            XCTAssertEqual(indexByCharacter[character], expectedIndex, "\(character) の index が違う")
             XCTAssertEqual(vocab.character(at: expectedIndex), character, "character(at: \(expectedIndex)) が違う")
         }
     }

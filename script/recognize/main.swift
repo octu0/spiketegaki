@@ -28,7 +28,9 @@ struct Options {
     var invert = false          // 既定は黒字白地。--invert で白字黒地
     var topK = 5
     var datasetPath: String?
-    var limit = 0               // 0 = 全件
+    var benchPath: String?
+    var limit = 0               // 0 = 全件 (--bench では 0 を弾く)
+    var limitSpecified = false  // --limit を明示したか (--bench の既定 1000 と区別する)
     var dumpSamplesDir: String?
     var dumpCount = 20
     var dumpScale = 8
@@ -64,7 +66,10 @@ struct Options {
             case "--invert":         o.invert = true
             case "--top-k":          o.topK = int(a, min: 1)
             case "--dataset":        o.datasetPath = next(a)
-            case "--limit":          o.limit = int(a, min: 0)
+            case "--bench":          o.benchPath = next(a)
+            case "--limit":
+                o.limit = int(a, min: 0)
+                o.limitSpecified = true
             case "--dump-samples":   o.dumpSamplesDir = next(a)
             case "--dump-count":     o.dumpCount = int(a, min: 1)
             case "--dump-scale":     o.dumpScale = int(a, min: 1)
@@ -88,6 +93,7 @@ func printUsage() {
 
       swift run -c release recognize --weights <json> [--invert] <png...>
       swift run -c release recognize --weights <json> --dataset <stgk> [--limit N]
+      swift run -c release recognize --weights <json> --bench <stgk> [--limit N]
       swift run -c release recognize --random-weights --layers 4 --hidden 512 --dataset <stgk>
       swift run -c release recognize --weights <json> --export-weights <stgw>
 
@@ -100,7 +106,9 @@ func printUsage() {
       --invert                PNG が白字黒地のとき指定する (既定は黒字白地)
       --top-k <n>             PNG モードで表示する候補数 (既定 5)
       --dataset <stgk>        DatasetFile を CPU 分類器で評価する
+      --bench <stgk>          推論速度 (ms/件・RTF) と層ごとの発火率を測る
       --limit <n>             評価するサンプル数の上限 (既定 0 = 全件)
+                              --bench では既定 1000、0 は明示エラー
       --dump-samples <dir>    --dataset のサンプルを PNG に書き出す
       --dump-count <n>        書き出す枚数 (既定 20)
       --dump-scale <n>        書き出し時の拡大率 (既定 8 -> 256x256)
@@ -520,6 +528,358 @@ func inkBoundingBox(_ image: CharacterImage) -> (minX: Int, minY: Int, maxX: Int
     return maxX < 0 ? nil : (minX, minY, maxX, maxY)
 }
 
+// MARK: - ベンチマークモード
+
+/// `--bench` で `--limit` を省いたときに測る件数。
+let benchDefaultLimit = 1000
+/// 計測前に空回しする回数 (転置レイアウトの初回参照・ページフォールトを温める)。
+let benchWarmupIterations = 20
+/// RTF の基準。手書きで 1 文字を書くのにかかる時間を 1.5 秒と置く。
+let benchWritingMillis = 1500.0
+
+/// 1 件あたりの所要時間 (ms) の要約。
+///
+/// 中央値は件数が偶数なら中央 2 件の平均。p95 は nearest-rank
+/// (昇順 n 件の `ceil(0.95 * n)` 番目)。件数 0 では作らない (呼び出し側で弾く)。
+struct BenchStats {
+    let mean: Double
+    let median: Double
+    let p95: Double
+    let minimum: Double
+    let maximum: Double
+
+    init(_ values: [Double]) {
+        let sorted = values.sorted()
+        let n = sorted.count
+        var total = 0.0
+        var i = 0
+        while i < n {
+            total += sorted[i]
+            i += 1
+        }
+        self.mean = total / Double(n)
+        if n % 2 == 0 {
+            self.median = (sorted[n / 2 - 1] + sorted[n / 2]) / 2.0
+        } else {
+            self.median = sorted[n / 2]
+        }
+        let rank = Int((0.95 * Double(n)).rounded(.up))
+        self.p95 = sorted[max(0, min(n - 1, rank - 1))]
+        self.minimum = sorted[0]
+        self.maximum = sorted[n - 1]
+    }
+}
+
+/// 端末での表示幅 (全角は 2 桁)。表の列を揃えるためだけに使う。
+func benchDisplayWidth(_ s: String) -> Int {
+    var width = 0
+    for scalar in s.unicodeScalars {
+        let v = scalar.value
+        // CJK・かな・全角記号は 2 桁扱い
+        if (0x1100...0x115F).contains(v) || (0x2E80...0xA4CF).contains(v)
+            || (0xAC00...0xD7A3).contains(v) || (0xF900...0xFAFF).contains(v)
+            || (0xFE30...0xFE6F).contains(v) || (0xFF00...0xFF60).contains(v)
+            || (0xFFE0...0xFFE6).contains(v) {
+            width += 2
+        } else {
+            width += 1
+        }
+    }
+    return width
+}
+
+/// 単調増加クロックで測った経過ミリ秒。
+@inline(__always)
+func benchElapsedMillis(since start: UInt64) -> Double {
+    return Double(DispatchTime.now().uptimeNanoseconds - start) / 1_000_000.0
+}
+
+/// 層ごとの「forward 後に発火しているニューロンの割合」をフレーム平均で返す。
+///
+/// `classifyLogits` と同じ順序で 32 フレームを forward する (読み出し線形層は掛けない)。
+/// `forward` は内部で `timeSteps` 回まわるので、ここで読めるのは
+/// **各フレームの最後の内部ステップの spike 状態**。計測用の
+/// 「forward 後の spike 状態の平均」をそのまま取っているだけで、
+/// 内部ステップ全体の平均ではない。計測のためにライブラリへフックは足さない。
+func benchLayerFiringRates(network: SpikingNetwork, frames: [[Float]]) -> [Double] {
+    let hSize = network.maxHiddenDim
+    let stateSize = network.numLayers * hSize
+    var vPrev = [Float](repeating: 0.0, count: stateSize)
+    var sPrev = [Float](repeating: 0.0, count: stateSize)
+    var aPrev = [Float](repeating: 0.0, count: stateSize)
+    var readoutSum = [Float](repeating: 0.0, count: hSize)
+    let scratch = ForwardScratch(maxHiddenDim: hSize)
+
+    var rates = [Double](repeating: 0.0, count: network.numLayers)
+    var t = 0
+    while t < frames.count {
+        network.forward(
+            features: frames[t],
+            vPrev: &vPrev,
+            sPrev: &sPrev,
+            aPrev: &aPrev,
+            readoutSum: &readoutSum,
+            scratch: scratch
+        )
+        var layer = 0
+        while layer < network.numLayers {
+            let base = layer * hSize
+            var fired = 0
+            var n = 0
+            while n < hSize {
+                if sPrev[base + n] != 0.0 {
+                    fired += 1
+                }
+                n += 1
+            }
+            rates[layer] += Double(fired) / Double(hSize)
+            layer += 1
+        }
+        t += 1
+    }
+    let divisor = Double(max(1, frames.count))
+    var layer = 0
+    while layer < network.numLayers {
+        rates[layer] /= divisor
+        layer += 1
+    }
+    return rates
+}
+
+/// 推論速度 (ms/件、文字/秒、µs/フレーム、RTF) と層ごとの発火率を測る。
+///
+/// 分類そのものは `--dataset` と同じ `CharacterClassifier.classify` / `classifyLogits` を呼ぶ。
+/// 計測専用の推論経路は作らない (本番と違う経路を測っても速度の根拠にならない)。
+func runBenchMode(_ o: Options, classifier: CharacterClassifier, path: String) -> Int32 {
+    // --limit 0 は「全件」の意味では使わせない。件数を明示させる
+    if o.limitSpecified && o.limit <= 0 {
+        fail("--bench の --limit には 1 以上を渡してください (0 = 全件は使えません): \(o.limit)")
+    }
+    let url = URL(fileURLWithPath: path)
+    var isDir: ObjCBool = false
+    if !FileManager.default.fileExists(atPath: url.path, isDirectory: &isDir) || isDir.boolValue {
+        fail("ベンチ用のデータセットがありません: \(path)")
+    }
+    let reader: DatasetReader
+    do {
+        reader = try DatasetReader(url: url)
+    } catch {
+        fail("データセットを開けません: \(path): \(error)")
+    }
+    defer { reader.close() }
+    if reader.count == 0 {
+        fail("データセットにサンプルが 1 件もありません: \(path)")
+    }
+
+    let requested = o.limitSpecified ? o.limit : benchDefaultLimit
+    let total = min(requested, reader.count)
+    let network = classifier.network
+    let vocab = classifier.vocabulary
+
+    // ファイル読み込みを計測に混ぜないよう、先に全件をメモリへ載せる
+    var images = [CharacterImage]()
+    var labels = [Int]()
+    images.reserveCapacity(total)
+    labels.reserveCapacity(total)
+    var i = 0
+    while i < total {
+        let sample: DatasetSample
+        do {
+            sample = try reader.sample(at: i)
+        } catch {
+            fail("サンプル \(i) を読めません: \(error)")
+        }
+        if sample.label < 0 || sample.label >= vocab.count {
+            fail("サンプル \(i) のラベル \(sample.label) が語彙 \(vocab.count) の範囲外です")
+        }
+        images.append(sample.image)
+        labels.append(sample.label)
+        i += 1
+    }
+
+    func warmUp(_ body: (Int) -> Void) {
+        var w = 0
+        while w < benchWarmupIterations {
+            body(w % total)
+            w += 1
+        }
+    }
+
+    // --- 計測ループ ---
+    //
+    // 3 区分 (符号化 / SNN 本体 / 本番経路) を **1 件ごとに続けて** 測る。
+    // 区分ごとに 1000 件まとめて回す作りにすると、同じマシンで他の処理
+    // (別ワーカーの MLX 学習など) が動いているとき、後に回した区分だけが遅くなって
+    // 「SNN 本体が本番経路より遅い」という起こり得ない結果になる (実測でそうなった)。
+    // 1 件の中で続けて測れば、外的負荷の変動は 3 区分に等しくかかる。
+    //
+    // SNN 本体は直前に符号化したフレームをそのまま使う (符号化の時間は含めない)。
+    // 1000 件分を事前に配列へ溜めて使い回すと [Float] が 32000 本ばらまかれて
+    // キャッシュの当たり方が本番経路と変わるので、溜めない。
+    var fullMillis = [Double](repeating: 0.0, count: total)
+    var encodeMillis = [Double](repeating: 0.0, count: total)
+    var snnMillis = [Double](repeating: 0.0, count: total)
+    var top1 = 0
+    var top5 = 0
+    warmUp { idx in
+        _ = ScanlineEncoder.encode(images[idx])
+        _ = try? network.classifyLogits(frames: ScanlineEncoder.encode(images[idx]))
+        _ = try? classifier.classify(image: images[idx], topK: 5)
+    }
+
+    let loopStarted = DispatchTime.now().uptimeNanoseconds
+    i = 0
+    while i < total {
+        // 1. 符号化のみ
+        let encodeStarted = DispatchTime.now().uptimeNanoseconds
+        let frames = ScanlineEncoder.encode(images[i])
+        encodeMillis[i] = benchElapsedMillis(since: encodeStarted)
+        if frames.count != ScanlineEncoder.frameCount {
+            fail("符号化のフレーム数が \(frames.count) です (\(ScanlineEncoder.frameCount) を期待)")
+        }
+
+        // 2. SNN 本体のみ (32 フレーム forward + 末尾平均)
+        let snnStarted = DispatchTime.now().uptimeNanoseconds
+        do {
+            _ = try network.classifyLogits(frames: frames)
+        } catch {
+            fail("サンプル \(i) の classifyLogits が失敗しました: \(error)")
+        }
+        snnMillis[i] = benchElapsedMillis(since: snnStarted)
+
+        // 3. 本番経路 (--dataset と同じ呼び出し)
+        let fullStarted = DispatchTime.now().uptimeNanoseconds
+        let top: [(character: Character, index: Int, probability: Float)]
+        do {
+            top = try classifier.classify(image: images[i], topK: 5)
+        } catch {
+            fail("サンプル \(i) を分類できません: \(error)")
+        }
+        fullMillis[i] = benchElapsedMillis(since: fullStarted)
+
+        if top.first?.index == labels[i] {
+            top1 += 1
+        }
+        if top.contains(where: { $0.index == labels[i] }) {
+            top5 += 1
+        }
+        i += 1
+    }
+    let loopMillis = benchElapsedMillis(since: loopStarted)
+
+    // 計測中にマシンの状態が変わっていないかの目安。前半と後半で大きく違えば
+    // 他の処理と取り合っている (平均より最小値・中央値を見るべき)
+    var firstHalf = 0.0
+    var secondHalf = 0.0
+    let half = total / 2
+    i = 0
+    while i < total {
+        if i < half {
+            firstHalf += fullMillis[i]
+        } else {
+            secondHalf += fullMillis[i]
+        }
+        i += 1
+    }
+    let firstHalfMean = half > 0 ? firstHalf / Double(half) : 0.0
+    let secondHalfMean = total - half > 0 ? secondHalf / Double(total - half) : 0.0
+
+    // --- 層ごとの発火率 (計測対象外。時間には含めない) ---
+    var firing = [Double](repeating: 0.0, count: network.numLayers)
+    i = 0
+    while i < total {
+        let rates = benchLayerFiringRates(network: network, frames: ScanlineEncoder.encode(images[i]))
+        var layer = 0
+        while layer < network.numLayers {
+            firing[layer] += rates[layer]
+            layer += 1
+        }
+        i += 1
+    }
+    var layer = 0
+    while layer < network.numLayers {
+        firing[layer] /= Double(total)
+        layer += 1
+    }
+
+    let full = BenchStats(fullMillis)
+    let enc = BenchStats(encodeMillis)
+    let snn = BenchStats(snnMillis)
+    let frameCount = ScanlineEncoder.frameCount
+
+    print("== 推論速度ベンチマーク ==")
+    print("  データセット  : \(path)  (全 \(reader.count) 件のうち先頭 \(total) 件)")
+    if let w = o.weightsPath {
+        print("  重み          : \(w)")
+    } else {
+        print("  重み          : --random-weights (乱数)")
+    }
+    print("  ネットワーク  : \(network.numLayers) 層  隠れ次元 \(network.maxHiddenDim)  出力 \(network.outputDim)  timeSteps \(network.timeSteps)  readoutFrames \(network.readoutFrames)")
+    print("  フレーム      : \(frameCount) フレーム/文字  フレーム次元 \(network.inputDim)")
+    print("  実行条件      : 単一スレッド (計測経路に並列化なし)、ウォームアップ \(benchWarmupIterations) 回")
+    print("")
+    print("  区分                          平均 ms   中央値 ms    p95 ms    最小 ms    最大 ms")
+    print(String(format: "  本番経路 (符号化+SNN+top5)  %9.3f %9.3f %9.3f %9.3f %9.3f",
+                 full.mean, full.median, full.p95, full.minimum, full.maximum))
+    print(String(format: "  SNN 本体 (classifyLogits)   %9.3f %9.3f %9.3f %9.3f %9.3f",
+                 snn.mean, snn.median, snn.p95, snn.minimum, snn.maximum))
+    print(String(format: "  符号化のみ (encode)         %9.3f %9.3f %9.3f %9.3f %9.3f",
+                 enc.mean, enc.median, enc.p95, enc.minimum, enc.maximum))
+    print(String(format: "  差分 (softmax + top-5 選択) %9.3f         -         -         -         -",
+                 full.mean - snn.mean - enc.mean))
+    print("")
+    print(String(format: "  文字/秒        : %.1f  (本番経路の平均から 1000 / %.3f)", 1000.0 / full.mean, full.mean))
+    print(String(format: "  µs/フレーム    : %.1f  (SNN 本体の平均 %.3f ms / %d フレーム)",
+                 snn.mean * 1000.0 / Double(frameCount), snn.mean, frameCount))
+    print(String(format: "  RTF            : %.5f  (本番経路の平均 %.3f ms / 筆記 %.0f ms)",
+                 full.mean / benchWritingMillis, full.mean, benchWritingMillis))
+    print(String(format: "  RTF (SNN 本体) : %.5f", snn.mean / benchWritingMillis))
+    print(String(format: "  RTF (最小値基準): %.5f  (本番経路の最小 %.3f ms / 筆記 %.0f ms)",
+                 full.minimum / benchWritingMillis, full.minimum, benchWritingMillis))
+    print("")
+    print(String(format: "  -- 計測の安定性 (本番経路) --"))
+    print(String(format: "    前半 %d 件の平均 %.3f ms / 後半 %d 件の平均 %.3f ms  (比 %.2f)",
+                 half, firstHalfMean, total - half, secondHalfMean,
+                 firstHalfMean > 0.0 ? secondHalfMean / firstHalfMean : 0.0))
+    print(String(format: "    計測ループ全体 %.1f 秒。比が 1.0 から大きく外れていたら他の処理と CPU を取り合っている。", loopMillis / 1000.0))
+    print("")
+    print("  -- 層ごとの平均発火率 (forward 後の spike 状態、\(total) 件 x \(frameCount) フレーム) --")
+    var sumRate = 0.0
+    layer = 0
+    while layer < network.numLayers {
+        let role: String
+        if network.numLayers == 1 {
+            role = "再帰 LIF + 読み出し"
+        } else if layer == 0 {
+            role = "再帰 LIF"
+        } else if layer == network.numLayers - 1 {
+            role = "FF LIF + 読み出し"
+        } else {
+            role = "FF LIF"
+        }
+        let label = "層 \(layer) (\(role))"
+        print(String(format: "    %@%@: %.4f  (%.1f / %d ニューロン)",
+                     label as NSString,
+                     String(repeating: " ", count: max(1, 30 - benchDisplayWidth(label))),
+                     firing[layer],
+                     firing[layer] * Double(network.maxHiddenDim),
+                     network.maxHiddenDim))
+        sumRate += firing[layer]
+        layer += 1
+    }
+    let meanLabel = "全層平均"
+    print(String(format: "    %@%@: %.4f",
+                 meanLabel as NSString,
+                 String(repeating: " ", count: max(1, 30 - benchDisplayWidth(meanLabel))),
+                 sumRate / Double(network.numLayers)))
+    print("    注: forward 1 回は内部で timeSteps \(network.timeSteps) 回まわる。ここで読めるのは各フレームの最後の内部ステップの発火。")
+    print("")
+    print(String(format: "  参考: top-1 %.4f (%d / %d)  top-5 %.4f (%d / %d)",
+                 Double(top1) / Double(total), top1, total,
+                 Double(top5) / Double(total), top5, total))
+    return 0
+}
+
 // MARK: - 重みのバイナリ書き出し
 
 /// 重み JSON を STGW v1 のバイナリに変換する。wasm では JSON を通さずこれを読む。
@@ -583,15 +943,21 @@ func run() {
     if let out = o.exportWeightsPath {
         exit(runExportWeights(o, to: out))
     }
-    if o.datasetPath == nil && o.pngPaths.isEmpty {
+    if o.datasetPath == nil && o.benchPath == nil && o.pngPaths.isEmpty {
         printUsage()
-        fail("PNG のパスか --dataset を指定してください")
+        fail("PNG のパスか --dataset か --bench を指定してください")
     }
     let classifier = makeClassifier(o)
 
     var code: Int32 = 0
     if let dataset = o.datasetPath {
         code = runDatasetMode(o, classifier: classifier, path: dataset)
+    }
+    if let bench = o.benchPath {
+        let c = runBenchMode(o, classifier: classifier, path: bench)
+        if c != 0 {
+            code = c
+        }
     }
     if !o.pngPaths.isEmpty {
         let c = runPNGMode(o, classifier: classifier)

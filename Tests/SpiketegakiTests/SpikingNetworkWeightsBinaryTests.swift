@@ -18,25 +18,25 @@ final class SpikingNetworkWeightsBinaryTests: XCTestCase {
 
     private func seedWeights(_ net: SpikingNetwork, seed: UInt64) {
         var rng = SeededRandom(seed: seed)
-        func fill(_ param: Parameter, _ range: Float) {
+        func fill(_ data: inout [Float], _ range: Float) {
             var i = 0
-            while i < param.count {
-                param.data[i] = rng.next(in: range)
+            while i < data.count {
+                data[i] = rng.next(in: range)
                 i += 1
             }
         }
-        fill(net.pWIn, 0.5)
-        fill(net.pWRec, 0.2)
-        fill(net.pBH, 0.35)
+        fill(&net.wIn, 0.5)
+        fill(&net.wRec, 0.2)
+        fill(&net.bH, 0.35)
         var l = 0
-        while l < net.pWLayers.count {
-            fill(net.pWLayers[l], 0.4)
-            fill(net.pBHLayers[l], 0.1)
-            fill(net.pGammaRMS[l], 0.9)
+        while l < net.wLayers.count {
+            fill(&net.wLayers[l], 0.4)
+            fill(&net.bHLayers[l], 0.1)
+            fill(&net.gammaRMS[l], 0.9)
             l += 1
         }
-        fill(net.pWOut, 0.3)
-        fill(net.pBOut, 0.05)
+        fill(&net.wOut, 0.3)
+        fill(&net.bOut, 0.05)
         net.rebuildInferenceLayout()
     }
 
@@ -51,7 +51,7 @@ final class SpikingNetworkWeightsBinaryTests: XCTestCase {
             maxHiddenDim: 16,
             outputDim: 5,
             timeSteps: 3,
-            lifConfig: LIFConfig(beta: 0.75, vTh: 1.1, vReset: 0.25, alpha: 2.5, rho: 0.8, gamma: 0.2),
+            lifConfig: LIFConfig(beta: 0.75, vTh: 1.1, alpha: 2.5, rho: 0.8, gamma: 0.2),
             readoutFrames: readoutFrames
         )
         seedWeights(net, seed: seed)

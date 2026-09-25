@@ -31,11 +31,6 @@ public final class MLXClassificationTrainer: @unchecked Sendable {
     /// 同じキーのコンパイル済み平均ロジット (評価用、勾配なし)
     private var compiledMeanLogits: [Int: ([MLXArray]) -> [MLXArray]] = [:]
 
-    /// 学習ステップのコンパイル (キャッシュミス) 回数
-    public private(set) var compileCount: Int = 0
-    /// 学習ステップのキャッシュヒット回数
-    public private(set) var cacheHitCount: Int = 0
-
     /// MLX が使い回しのために抱えるバッファキャッシュの上限。
     public static let cacheLimitBytes = 8 << 30
 
@@ -52,16 +47,6 @@ public final class MLXClassificationTrainer: @unchecked Sendable {
     /// 学習率を更新。配列で持つので compile 済みステップにも入力として渡る
     public func updateLearningRate(_ lr: Float) {
         self.optimizer.learningRate = MLXArray(lr)
-    }
-
-    /// 重みを保存済みの状態へ巻き戻す。Adam のモーメントも捨て、
-    /// 古い重みを参照している compile 済みステップも作り直す
-    public func rollback(to weights: SpikingNetworkWeights) {
-        network.importWeights(from: weights)
-        optimizer.resetState()
-        compiledTrainSteps.removeAll()
-        compiledMeanLogits.removeAll()
-        eval(network, optimizer)
     }
 
     // MARK: - フォワード
@@ -234,10 +219,8 @@ public final class MLXClassificationTrainer: @unchecked Sendable {
 
         let stepFn: ([MLXArray]) -> [MLXArray]
         if let cached = compiledTrainSteps[key] {
-            cacheHitCount += 1
             stepFn = cached
         } else {
-            compileCount += 1
             let maxNorm = config.clipNorm
             let lg = valueAndGrad(model: network) { (model: MLXSpikingNetwork, arrays: [MLXArray]) -> [MLXArray] in
                 return [self.lossBatch(network: model, features: arrays[0], labels: arrays[1])]

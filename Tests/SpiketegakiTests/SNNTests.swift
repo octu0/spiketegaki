@@ -24,57 +24,37 @@ final class SNNTests: XCTestCase {
     /// ネットワークの全パラメータを種から決め打ちで埋める
     private func seedWeights(_ net: SpikingNetwork, seed: UInt64) {
         var rng = SeededRandom(seed: seed)
-        func fill(_ param: Parameter, _ range: Float) {
+        func fill(_ data: inout [Float], _ range: Float) {
             var i = 0
-            while i < param.count {
-                param.data[i] = rng.next(in: range)
+            while i < data.count {
+                data[i] = rng.next(in: range)
                 i += 1
             }
         }
-        fill(net.pWIn, sqrt(2.0 / Float(net.inputDim)))
-        fill(net.pWRec, sqrt(2.0 / Float(net.maxHiddenDim)) * 0.2)
-        fill(net.pBH, 0.35)
+        fill(&net.wIn, sqrt(2.0 / Float(net.inputDim)))
+        fill(&net.wRec, sqrt(2.0 / Float(net.maxHiddenDim)) * 0.2)
+        fill(&net.bH, 0.35)
         var l = 0
-        while l < net.pWLayers.count {
-            fill(net.pWLayers[l], sqrt(2.0 / Float(net.maxHiddenDim)))
-            fill(net.pBHLayers[l], 0.1)
+        while l < net.wLayers.count {
+            fill(&net.wLayers[l], sqrt(2.0 / Float(net.maxHiddenDim)))
+            fill(&net.bHLayers[l], 0.1)
             var i = 0
-            while i < net.pGammaRMS[l].count {
-                net.pGammaRMS[l].data[i] = 1.0
+            while i < net.gammaRMS[l].count {
+                net.gammaRMS[l][i] = 1.0
                 i += 1
             }
             l += 1
         }
-        fill(net.pWOut, sqrt(2.0 / Float(net.maxHiddenDim)))
-        fill(net.pBOut, 0.1)
+        fill(&net.wOut, sqrt(2.0 / Float(net.maxHiddenDim)))
+        fill(&net.bOut, 0.1)
         net.rebuildInferenceLayout()
     }
 
     // MARK: - LIF 1 ステップの手計算一致
 
-    /// 隠れ層 LIF: v = clamp(beta * vPrev * (1 - sPrev) + I)、発火は vTh <= v
-    func testLIFStepScalarMatchesHandCalculation() {
-        let config = LIFConfig(beta: 0.8, vTh: 1.0, vReset: 0.0, alpha: 2.0)
-
-        // 0.8 * 0.5 * (1 - 0) + 0.7 = 1.1 >= 1.0 -> 発火
-        let fired = LIFNeuronEngine.stepScalar(config: config, vPrev: 0.5, sPrev: 0.0, inputCurrent: 0.7)
-        XCTAssertEqual(fired.vNext, 1.1, accuracy: 1e-6)
-        XCTAssertEqual(fired.sNext, 1.0)
-
-        // 直前に発火していればハードリセット: 0.8 * 0.5 * (1 - 1) + 0.3 = 0.3 < 1.0 -> 非発火
-        let reset = LIFNeuronEngine.stepScalar(config: config, vPrev: 0.5, sPrev: 1.0, inputCurrent: 0.3)
-        XCTAssertEqual(reset.vNext, 0.3, accuracy: 1e-6)
-        XCTAssertEqual(reset.sNext, 0.0)
-
-        // 飽和: 0.8 * 0.0 + 100.0 -> +20.0 に張り付く
-        let saturated = LIFNeuronEngine.stepScalar(config: config, vPrev: 0.0, sPrev: 0.0, inputCurrent: 100.0)
-        XCTAssertEqual(saturated.vNext, LIFNeuronEngine.vClampMax)
-        XCTAssertEqual(saturated.sNext, 1.0)
-    }
-
     /// ALIF: a = rho * aPrev + gamma * sPrev、発火閾値は vTh + a
     func testLIFStepAdaptiveMatchesHandCalculation() {
-        let config = LIFConfig(beta: 0.8, vTh: 1.0, vReset: 0.0, alpha: 2.0, rho: 0.85, gamma: 0.5)
+        let config = LIFConfig(beta: 0.8, vTh: 1.0, alpha: 2.0, rho: 0.85, gamma: 0.5)
 
         // v: 0.8 * 0.5 * (1 - 1) + 0.7 = 0.7
         // a: 0.85 * 0.2 + 0.5 * 1 = 0.67 -> dynVTh = 1.67 > 0.7 -> 非発火
@@ -88,7 +68,7 @@ final class SNNTests: XCTestCase {
 
     /// 最終層: リーク積分 -> 閾値単位で読み出し -> subtractive reset (余りを残す)
     func testLIFReadoutStepMatchesHandCalculation() {
-        let config = LIFConfig(beta: 0.8, vTh: 1.0, vReset: 0.0, alpha: 2.0)
+        let config = LIFConfig(beta: 0.8, vTh: 1.0, alpha: 2.0)
 
         // vIntegrated = 0.8 * 0.5 + 0.7 = 1.1 -> 発火、readout は 1.0 にクリップ、v は 1.1 - 1.0 = 0.1
         let res = LIFNeuronEngine.stepReadoutScalarAdaptive(
@@ -109,7 +89,7 @@ final class SNNTests: XCTestCase {
 
     /// SIMD8 版とスカラー版が同じ結果を出す (端数レーンも含む)
     func testLIFSIMD8MatchesScalar() {
-        let config = LIFConfig(beta: 0.8, vTh: 1.0, vReset: 0.0, alpha: 2.0, rho: 0.85, gamma: 0.3)
+        let config = LIFConfig(beta: 0.8, vTh: 1.0, alpha: 2.0, rho: 0.85, gamma: 0.3)
         let count = 19   // 8 の倍数ではない = 端数処理も通る
         var v = [Float](repeating: 0.0, count: count)
         var s = [Float](repeating: 0.0, count: count)
@@ -153,51 +133,6 @@ final class SNNTests: XCTestCase {
         }
     }
 
-    // MARK: - 代理勾配
-
-    /// dS/dV = 1 / (1 + alpha * |V - Vth|)^2
-    func testSurrogateGradientValues() {
-        XCTAssertEqual(SurrogateGradient.derivative(v: 1.0, vTh: 1.0, alpha: 2.0), 1.0, accuracy: 1e-6)
-        // |1.5 - 1.0| = 0.5 -> 1 / (1 + 1.0)^2 = 0.25
-        XCTAssertEqual(SurrogateGradient.derivative(v: 1.5, vTh: 1.0, alpha: 2.0), 0.25, accuracy: 1e-6)
-        // |0.0 - 1.0| = 1.0 -> 1 / 3^2 = 0.111...
-        XCTAssertEqual(SurrogateGradient.derivative(v: 0.0, vTh: 1.0, alpha: 2.0), 1.0 / 9.0, accuracy: 1e-6)
-        // 対称性
-        XCTAssertEqual(
-            SurrogateGradient.derivative(v: 0.3, vTh: 1.0, alpha: 3.0),
-            SurrogateGradient.derivative(v: 1.7, vTh: 1.0, alpha: 3.0),
-            accuracy: 1e-6
-        )
-    }
-
-    func testSurrogateGradientSIMD8MatchesScalar() {
-        let count = 19
-        var v = [Float](repeating: 0.0, count: count)
-        var dst = [Float](repeating: 0.0, count: count)
-        var i = 0
-        while i < count {
-            v[i] = Float(i) * 0.17 - 1.0
-            i += 1
-        }
-        v.withUnsafeBufferPointer { vb in
-            dst.withUnsafeMutableBufferPointer { db in
-                SurrogateGradient.derivativeSIMD8(
-                    vPtr: vb.baseAddress!, dstPtr: db.baseAddress!, count: count, vTh: 1.0, alpha: 2.0
-                )
-            }
-        }
-        i = 0
-        while i < count {
-            XCTAssertEqual(
-                dst[i],
-                SurrogateGradient.derivative(v: v[i], vTh: 1.0, alpha: 2.0),
-                accuracy: 1e-6,
-                "surrogate mismatch at \(i)"
-            )
-            i += 1
-        }
-    }
-
     // MARK: - classifyLogits
 
     private func makeSmallNetwork(
@@ -218,27 +153,97 @@ final class SNNTests: XCTestCase {
         return net
     }
 
-    /// 各フレームのロジットを直に回して集める参照実装 (classifyLogits を使わない)
+    /// 1 フレーム分の `readoutSum` に読み出し線形層を掛けた、そのフレームのロジット (参照実装)。
+    ///
+    /// 本体の最適化経路が使う転置コピー `wOutT` ではなく、元の `wOut` (行 = クラス) を
+    /// 素直にスカラーで掛ける。本体と独立した参照にするため。
+    private func frameLogitsReference(_ net: SpikingNetwork, readoutSum: [Float]) -> [Float] {
+        let hSize = net.maxHiddenDim
+        let invT = 1.0 / Float(net.timeSteps)
+        var logits = [Float](repeating: 0.0, count: net.outputDim)
+        var c = 0
+        while c < net.outputDim {
+            var sum = net.bOut[c]
+            let rowOffset = c * hSize
+            var k = 0
+            while k < hSize {
+                sum += net.wOut[rowOffset + k] * (readoutSum[k] * invT)
+                k += 1
+            }
+            logits[c] = sum
+            c += 1
+        }
+        return logits
+    }
+
+    /// 各フレームのロジットを直に回して集める参照実装 (classifyLogits を使わない)。
+    ///
+    /// `forward` は 2026-09-25 からロジットを返さず `readoutSum` だけを書くので、
+    /// 読み出し線形層はここで (フレームごとに) 掛ける。これが最適化前の旧実装と同じ計算順序。
     private func perFrameLogits(_ net: SpikingNetwork, frames: [[Float]]) -> [[Float]] {
         let hSize = net.maxHiddenDim
         var vPrev = [Float](repeating: 0.0, count: net.numLayers * hSize)
         var sPrev = [Float](repeating: 0.0, count: net.numLayers * hSize)
         var aPrev = [Float](repeating: 0.0, count: net.numLayers * hSize)
         var readoutSum = [Float](repeating: 0.0, count: hSize)
-        var logits = [Float](repeating: 0.0, count: net.outputDim)
-        var probs = [Float](repeating: 0.0, count: net.outputDim)
         let scratch = ForwardScratch(maxHiddenDim: hSize)
         var out: [[Float]] = []
         var t = 0
         while t < frames.count {
             net.forward(
                 features: frames[t], vPrev: &vPrev, sPrev: &sPrev, aPrev: &aPrev,
-                readoutSum: &readoutSum, logits: &logits, probabilities: &probs, scratch: scratch
+                readoutSum: &readoutSum, scratch: scratch
             )
-            out.append(logits)
+            out.append(frameLogitsReference(net, readoutSum: readoutSum))
             t += 1
         }
         return out
+    }
+
+    /// 参照値との一致を確かめる。**ビット一致ではなく許容誤差つき。**
+    ///
+    /// 2026-09-25 に読み出し線形層を「フレームごとに掛けて平均」から
+    /// 「平均してから 1 回掛ける」に変えた。数学的には同値だが
+    /// 浮動小数の丸めの順序が変わるのでビット一致はしない。argmax も一致することを見る。
+    private func assertLogitsClose(
+        _ actual: [Float],
+        _ expected: [Float],
+        accuracy: Float = 1e-4,
+        _ message: String = "",
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) {
+        XCTAssertEqual(actual.count, expected.count, message, file: file, line: line)
+        guard actual.count == expected.count, !actual.isEmpty else {
+            return
+        }
+        var worst: Float = 0.0
+        var argmaxActual = 0
+        var argmaxExpected = 0
+        var c = 0
+        while c < actual.count {
+            let d = abs(actual[c] - expected[c])
+            if d > worst {
+                worst = d
+            }
+            if actual[argmaxActual] < actual[c] {
+                argmaxActual = c
+            }
+            if expected[argmaxExpected] < expected[c] {
+                argmaxExpected = c
+            }
+            c += 1
+        }
+        XCTAssertLessThanOrEqual(
+            worst, accuracy,
+            "\(message) 最大絶対差 \(worst) が許容 \(accuracy) を超えた",
+            file: file, line: line
+        )
+        XCTAssertEqual(
+            argmaxActual, argmaxExpected,
+            "\(message) argmax が違う (actual \(argmaxActual) / expected \(argmaxExpected))",
+            file: file, line: line
+        )
     }
 
     /// 末尾 `readoutFrames` フレームのロジット平均 (参照値)
@@ -318,13 +323,71 @@ final class SNNTests: XCTestCase {
             XCTAssertEqual(perFrame.count, frameCount)
             let expected = tailMean(perFrame, readoutFrames: readoutFrames, outputDim: net.outputDim)
             let actual = try net.classifyLogits(frames: frames)
-            XCTAssertEqual(actual, expected, "readoutFrames = \(readoutFrames) で末尾平均と一致しない")
+            assertLogitsClose(actual, expected, "readoutFrames = \(readoutFrames) で末尾平均と一致しない:")
 
             // readoutFrames = 1 なら最終フレームのロジットそのもの
             if readoutFrames == 1 {
-                XCTAssertEqual(actual, perFrame[frameCount - 1])
+                assertLogitsClose(actual, perFrame[frameCount - 1], "readoutFrames = 1:")
             }
         }
+    }
+
+    /// 読み出し線形層を「フレームごとに掛けて平均」から
+    /// 「平均してから 1 文字に 1 回だけ掛ける」に変えた回帰テスト (2026-09-25)。
+    ///
+    /// ロジットは readout に線形なので mean_t(bOut + wOut・rate_t) = bOut + wOut・mean_t(rate_t)。
+    /// 本番に近い形 (4 層 / 隠れ 128 / 出力 512 / 32 フレーム / timeSteps 4) で、
+    /// **フレームごとに掛ける参照実装** (`perFrameLogits` + `tailMean`、旧実装と同じ計算順序) と
+    /// 許容 1e-4 で一致し、argmax も一致することを確かめる。
+    /// 丸めの順序が変わるのでビット一致はしない。実測の最大差はログに出す。
+    func testReadoutOncePerCharacterMatchesPerFrameReadout() throws {
+        var worstOverall: Float = 0.0
+        var checked = 0
+        for seed in [1, 2, 3] as [UInt64] {
+            for readoutFrames in [1, 8, 32] {
+                let net = SpikingNetwork(
+                    numLayers: 4,
+                    inputDim: 64,
+                    maxHiddenDim: 128,
+                    outputDim: 512,
+                    timeSteps: 4,
+                    lifConfig: LIFConfig(),
+                    readoutFrames: readoutFrames
+                )
+                seedWeights(net, seed: seed)
+                let frames = makeFrames(count: 32, dim: 64, seed: seed &+ 500)
+
+                let expected = tailMean(
+                    perFrameLogits(net, frames: frames),
+                    readoutFrames: readoutFrames,
+                    outputDim: net.outputDim
+                )
+                let actual = try net.classifyLogits(frames: frames)
+                assertLogitsClose(
+                    actual, expected,
+                    "seed \(seed) / readoutFrames \(readoutFrames):"
+                )
+
+                // ロジットが全部同じだと argmax 一致が空回りするので、ばらついていることを見る
+                var minV = expected[0]
+                var maxV = expected[0]
+                var c = 0
+                while c < expected.count {
+                    if expected[c] < minV { minV = expected[c] }
+                    if maxV < expected[c] { maxV = expected[c] }
+                    let d = abs(actual[c] - expected[c])
+                    if d > worstOverall { worstOverall = d }
+                    c += 1
+                }
+                XCTAssertGreaterThan(
+                    maxV - minV, 1e-3,
+                    "seed \(seed) / readoutFrames \(readoutFrames): ロジットがばらついていない"
+                )
+                checked += 1
+            }
+        }
+        XCTAssertEqual(checked, 9)
+        print("[Readout] 1 文字 1 回の読み出し vs フレームごとの読み出し: 最大絶対差 = \(worstOverall) (9 条件)")
     }
 
     /// readoutFrames を変えると結果も変わる (値が使われずに無視されていないこと)
@@ -344,7 +407,7 @@ final class SNNTests: XCTestCase {
         let frames = makeFrames(count: 5, dim: 8, seed: 11)
         let perFrame = perFrameLogits(net, frames: frames)
         let expected = tailMean(perFrame, readoutFrames: 5, outputDim: net.outputDim)
-        XCTAssertEqual(try net.classifyLogits(frames: frames), expected)
+        assertLogitsClose(try net.classifyLogits(frames: frames), expected)
     }
 
     /// 0 以下は投げずに 1 へ丸める (init の仕様)
@@ -356,12 +419,12 @@ final class SNNTests: XCTestCase {
         let net = makeSmallNetwork(seed: 11, readoutFrames: 0)
         let frames = makeFrames(count: 4, dim: 8, seed: 11)
         let perFrame = perFrameLogits(net, frames: frames)
-        XCTAssertEqual(try net.classifyLogits(frames: frames), perFrame[3])
+        assertLogitsClose(try net.classifyLogits(frames: frames), perFrame[3])
     }
 
     /// 既定値は 32 (全フレーム平均)。
     /// 末尾だけに絞ると実データでは劣った: kana 実験 (2026-09-24) の held-out 正解率は 32 で 63.8%、8 で 44.0%。
-    func testDefaultReadoutFramesIsThirtyTwo() {
+    func testDefaultReadoutFramesIsThirtyTwo() throws {
         XCTAssertEqual(SpikingNetwork(numLayers: 1, inputDim: 4, maxHiddenDim: 8, outputDim: 2).readoutFrames, 32)
 
         // 重み構造体のメモリ上の init も同じ既定値
@@ -389,8 +452,8 @@ final class SNNTests: XCTestCase {
         XCTAssertEqual(net.readoutFrames, 32)
         let frames = makeFrames(count: 32, dim: 8, seed: 11)
         let perFrame = perFrameLogits(net, frames: frames)
-        XCTAssertEqual(try net.classifyLogits(frames: frames),
-                       tailMean(perFrame, readoutFrames: 32, outputDim: net.outputDim))
+        assertLogitsClose(try net.classifyLogits(frames: frames),
+                          tailMean(perFrame, readoutFrames: 32, outputDim: net.outputDim))
     }
 
     func testClassifyLogitsThrowsOnEmptyInput() {
@@ -427,7 +490,7 @@ final class SNNTests: XCTestCase {
     func testWeightsJSONRoundTripReproducesIdenticalLogits() throws {
         let net = SpikingNetwork(
             numLayers: 3, inputDim: 8, maxHiddenDim: 16, outputDim: 5, timeSteps: 3,
-            lifConfig: LIFConfig(beta: 0.75, vTh: 1.1, vReset: 0.0, alpha: 2.5, rho: 0.8, gamma: 0.2)
+            lifConfig: LIFConfig(beta: 0.75, vTh: 1.1, alpha: 2.5, rho: 0.8, gamma: 0.2)
         )
         seedWeights(net, seed: 2024)
         let frames = makeFrames(count: 12, dim: 8, seed: 2024)
@@ -493,107 +556,7 @@ final class SNNTests: XCTestCase {
         let frames = makeFrames(count: 32, dim: 8, seed: 4242)
         let perFrame = perFrameLogits(restored, frames: frames)
         let allFrameMean = tailMean(perFrame, readoutFrames: 32, outputDim: restored.outputDim)
-        XCTAssertEqual(try restored.classifyLogits(frames: frames), allFrameMean)
-    }
-
-    // MARK: - QuantizedEngine
-
-    /// `QuantizedEngine` は層 0 のみ・状態を毎回リセットする。
-    /// そのため float32 側も 1 フレームごとに状態をゼロに戻して比較する。
-    ///
-    /// 量子化は閾値をまたぐニューロンの発火を変えるので、全フレームで argmax が
-    /// 完全一致することは保証できない。20 通りの重み × 32 フレーム = 640 件での
-    /// top-1 一致率で確認する (実測: int32 99.375%, int16 95.3125%, float16 99.6875%)。
-    func testQuantizedEngineArgmaxMatchesFloat32() {
-        let hidden = 64
-        let outDim = 32
-        let inDim = 64
-        let seedCount = 20
-        let frameCount = 32
-
-        let cases: [(name: String, config: QuantizedConfig, minRate: Float)] = [
-            ("int32", QuantizedConfig.int32Config(), 0.98),
-            ("int16", QuantizedConfig.int16Config(), 0.90),
-            ("float16", QuantizedConfig.float16Config(beta: 0.8, vTh: 1.0), 0.98)
-        ]
-
-        for testCase in cases {
-            var matches = 0
-            var total = 0
-            var distinctTops = Set<Int>()
-
-            var seed = 0
-            while seed < seedCount {
-                let net = SpikingNetwork(
-                    numLayers: 1, inputDim: inDim, maxHiddenDim: hidden, outputDim: outDim, timeSteps: 4,
-                    lifConfig: LIFConfig(beta: 0.8, vTh: 1.0, vReset: 0.0, alpha: 2.0, rho: 0.85, gamma: 0.0)
-                )
-                seedWeights(net, seed: UInt64(seed) &+ 1)
-                let frames = makeFrames(count: frameCount, dim: inDim, seed: UInt64(seed) &+ 900)
-
-                let engine = QuantizedEngine(
-                    weights: QuantizedEngine.quantize(network: net, config: testCase.config),
-                    timeSteps: 4
-                )
-                let workspace = QuantizedWorkspace(maxHiddenDim: hidden, inputDim: inDim, outputDim: outDim)
-                var quantProbs = [Float](repeating: 0.0, count: outDim)
-                var floatProbs = [Float](repeating: 0.0, count: outDim)
-                var logits = [Float](repeating: 0.0, count: outDim)
-                var readoutSum = [Float](repeating: 0.0, count: hidden)
-
-                var t = 0
-                while t < frames.count {
-                    var vPrev = [Float](repeating: 0.0, count: hidden)
-                    var sPrev = [Float](repeating: 0.0, count: hidden)
-                    var aPrev = [Float](repeating: 0.0, count: hidden)
-                    net.forward(
-                        features: frames[t], vPrev: &vPrev, sPrev: &sPrev, aPrev: &aPrev,
-                        readoutSum: &readoutSum, logits: &logits, probabilities: &floatProbs,
-                        scratch: ForwardScratch(maxHiddenDim: hidden)
-                    )
-                    engine.predict(features: frames[t], workspace: workspace, outputProbs: &quantProbs)
-
-                    var topFloat = 0
-                    var topQuant = 0
-                    var c = 1
-                    while c < outDim {
-                        if logits[topFloat] < logits[c] {
-                            topFloat = c
-                        }
-                        if quantProbs[topQuant] < quantProbs[c] {
-                            topQuant = c
-                        }
-                        c += 1
-                    }
-                    if topFloat == topQuant {
-                        matches += 1
-                    }
-                    total += 1
-                    distinctTops.insert(topFloat)
-
-                    var sumP: Float = 0.0
-                    c = 0
-                    while c < outDim {
-                        XCTAssertFalse(quantProbs[c].isNaN, "\(testCase.name): NaN が出た")
-                        XCTAssertFalse(quantProbs[c].isInfinite, "\(testCase.name): Inf が出た")
-                        sumP += quantProbs[c]
-                        c += 1
-                    }
-                    XCTAssertEqual(sumP, 1.0, accuracy: 1e-4, "\(testCase.name): softmax の和が 1 でない")
-                    t += 1
-                }
-                seed += 1
-            }
-
-            // argmax が常に同じだと一致率テストが空回りする
-            XCTAssertGreaterThanOrEqual(distinctTops.count, 2, "\(testCase.name): argmax が変化していない")
-            let rate = Float(matches) / Float(total)
-            print("[QuantizedEngine] \(testCase.name) top-1 一致率 = \(matches)/\(total) = \(rate)")
-            XCTAssertGreaterThanOrEqual(
-                rate, testCase.minRate,
-                "\(testCase.name): float32 との top-1 一致率 \(rate) が下限 \(testCase.minRate) を下回った"
-            )
-        }
+        assertLogitsClose(try restored.classifyLogits(frames: frames), allFrameMean)
     }
 
     // MARK: - 推論時間の計測

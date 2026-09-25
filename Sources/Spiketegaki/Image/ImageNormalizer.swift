@@ -70,17 +70,6 @@ public enum ImageNormalizer {
         return resampleToSquare(ink: values, width: width, height: height, invert: invert)
     }
 
-    /// 既に 32x32 のマス目になっている画像をもう一度通す。
-    /// マス目基準なので切り出しは起きず、結果は入力と同じ (冪等)。
-    /// 拡張の後に掛け直す用途は無い (`Augmenter` は再正規化しない)。
-    public static func normalize(_ image: CharacterImage) -> CharacterImage {
-        return resampleToSquare(
-            ink: image.pixels,
-            width: CharacterImage.side,
-            height: CharacterImage.side
-        )
-    }
-
     // MARK: - 内部
 
     private static func resampleToSquare(

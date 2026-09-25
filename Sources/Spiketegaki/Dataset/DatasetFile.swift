@@ -237,38 +237,6 @@ public final class DatasetReader: @unchecked Sendable {
         return try DatasetReader.decodeSample([UInt8](data))
     }
 
-    /// 全サンプルを順に読む。
-    public func readAll() throws -> [DatasetSample] {
-        if closed {
-            throw DatasetFileError.ioFailure("close 済みの DatasetReader から読んだ")
-        }
-        var out = [DatasetSample]()
-        out.reserveCapacity(sampleCount)
-        do {
-            try handle.seek(toOffset: UInt64(DatasetFormat.headerSize))
-        } catch {
-            throw DatasetFileError.ioFailure("本体の先頭に移動できない: \(error)")
-        }
-        var i = 0
-        while i < sampleCount {
-            let data: Data
-            do {
-                data = try handle.read(upToCount: DatasetFormat.sampleSize) ?? Data()
-            } catch {
-                throw DatasetFileError.ioFailure("サンプル \(i) を読めない: \(error)")
-            }
-            if data.count != DatasetFormat.sampleSize {
-                throw DatasetFileError.lengthMismatch(
-                    expected: DatasetFormat.expectedFileSize(count: sampleCount),
-                    actual: DatasetFormat.headerSize + i * DatasetFormat.sampleSize + data.count
-                )
-            }
-            out.append(try DatasetReader.decodeSample([UInt8](data)))
-            i += 1
-        }
-        return out
-    }
-
     public func close() {
         if closed {
             return
@@ -283,7 +251,7 @@ public final class DatasetReader: @unchecked Sendable {
         }
     }
 
-    /// `sample(at:)` と `readAll()` の共通経路。label の範囲検査もここで行う。
+    /// `sample(at:)` の復号経路。label の範囲検査もここで行う。
     private static func decodeSample(_ bytes: [UInt8]) throws -> DatasetSample {
         let label = Int(bytes[0]) | (Int(bytes[1]) << 8)
         // u16 なので負にはならないが、細工されたファイルはクラス数以上の label を持てる。
