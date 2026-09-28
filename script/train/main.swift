@@ -461,7 +461,7 @@ if let path = importPath {
     timeSteps = loaded.timeSteps
     network = MLXSpikingNetwork(weights: loaded)
 } else {
-    // 出力次元は常に語彙全体 (3236 クラス)。データセットに一部の区分しか無くても変えない。
+    // 出力次元は常に語彙全体 (CharacterVocabulary.count)。データセットに一部の区分しか無くても変えない。
     // 重みを別のデータセットへ使い回せるようにするため
     network = MLXSpikingNetwork(
         numLayers: numLayers,
@@ -545,7 +545,7 @@ struct EvalResult {
 }
 
 /// 1 サンプル分のロジットから top-1 / top-5 / 交差エントロピーを求める。
-/// logsumexp は最大値を引いてから計算する (3236 クラスの exp が溢れないように)
+/// logsumexp は最大値を引いてから計算する (数千クラスの exp が溢れないように)
 func scoreSample(
     logits: UnsafePointer<Float>,
     dim: Int,

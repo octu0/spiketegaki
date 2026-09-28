@@ -18,8 +18,10 @@ const WASM_PATH = '.tmp/demo/spiketegaki.wasm';
 const WEIGHTS_PATH = '.tmp/demo/kana.stgw';
 const DATASET_PATH = '.tmp/datasets/kana_eval.stgk';
 // kana.stgw の書き出し元と同じ JSON でなければ 3 段一致 (MLX → CPU → wasm) の
-// 検証にならないので、--export-weights に渡した JSON をここに合わせる。
-const JSON_WEIGHTS_PATH = '.tmp/weights/kana_R11.json';
+// 検証にならないので、--export-weights に渡した JSON と同じものを CPU 側に使う。
+// --json <パス> か環境変数 STGK_JSON_WEIGHTS で渡せる。省略時は下の既定
+// (.tmp/demo/kana.stgw を書き出した最新の最良重み) を使う。
+const DEFAULT_JSON_WEIGHTS_PATH = '.tmp/weights/kana_R15.json';
 
 const STGK_HEADER = 16;
 const STGK_PIXELS = 32 * 32;
@@ -28,26 +30,37 @@ const SIDE = 32;
 const TOP_K = 5;
 
 function parseArgs(argv) {
-  const o = { limit: 50, cpu: true };
+  const o = {
+    limit: 50,
+    cpu: true,
+    json: process.env.STGK_JSON_WEIGHTS || DEFAULT_JSON_WEIGHTS_PATH
+  };
   for (let i = 0; i < argv.length; i += 1) {
     if (argv[i] === '--limit') {
       o.limit = Number(argv[i + 1]);
       i += 1;
+    } else if (argv[i] === '--json') {
+      o.json = argv[i + 1];
+      i += 1;
     } else if (argv[i] === '--skip-cpu') {
       o.cpu = false;
     } else if (argv[i] === '--help' || argv[i] === '-h') {
-      console.log('node demo/check.mjs [--limit N] [--skip-cpu]');
+      console.log('node demo/check.mjs [--limit N] [--json <重み JSON>] [--skip-cpu]');
+      console.log(`  --json 省略時: ${DEFAULT_JSON_WEIGHTS_PATH} (環境変数 STGK_JSON_WEIGHTS でも指定できる)`);
       process.exit(0);
     }
+  }
+  if (!o.json) {
+    throw new Error('--json に重み JSON のパスを渡してください');
   }
   return o;
 }
 
 /** CPU 側の recognize --dataset を実際に回して top-1 / top-5 の件数を取り出す */
-function runCPURecognize(limit) {
+function runCPURecognize(limit, jsonWeightsPath) {
   const args = [
     'run', '-c', 'release', 'recognize',
-    '--weights', JSON_WEIGHTS_PATH,
+    '--weights', jsonWeightsPath,
     '--dataset', DATASET_PATH,
     '--limit', String(limit)
   ];
@@ -190,6 +203,7 @@ async function main() {
   const ctx = await boot();
   console.log(`wasm      : ${WASM_PATH}`);
   console.log(`重み      : ${WEIGHTS_PATH} (${ctx.weightsBytes} バイト)`);
+  console.log(`CPU 側重み: ${opts.json}`);
 
   const { count, samples } = readDataset(await readFile(DATASET_PATH), opts.limit);
   console.log(`データセット: ${DATASET_PATH} (全 ${count} 件のうち先頭 ${samples.length} 件)`);
@@ -220,7 +234,7 @@ async function main() {
   if (opts.cpu) {
     console.log('');
     console.log('-- CPU (recognize) との照合 --');
-    const cpu = runCPURecognize(n);
+    const cpu = runCPURecognize(n, opts.json);
     console.log(`  ${cpu.command}`);
     console.log(`  CPU  top-1 ${cpu.top1.hit} / ${cpu.top1.total}   top-5 ${cpu.top5.hit} / ${cpu.top5.total}`);
     console.log(`  wasm top-1 ${top1} / ${n}   top-5 ${top5} / ${n}`);

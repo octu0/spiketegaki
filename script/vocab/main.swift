@@ -52,9 +52,18 @@ struct VocabularyBuilder {
     }
 
     mutating func appendRange(_ lo: UInt32, _ hi: UInt32, context: String) {
+        appendRange(lo, hi, excluding: [], context: context)
+    }
+
+    /// `excluding` に含まれるコードポイントを飛ばしながら範囲を並べる。
+    mutating func appendRange(
+        _ lo: UInt32, _ hi: UInt32, excluding skip: Set<UInt32>, context: String
+    ) {
         var v = lo
         while v <= hi {
-            append(v, context: context)
+            if !skip.contains(v) {
+                append(v, context: context)
+            }
             v += 1
         }
     }
@@ -70,6 +79,40 @@ struct VocabularyBuilder {
         return seen.count
     }
 }
+
+/// 語彙から外す小書き仮名 (DESIGN.md §4、2026-09-28 決定)。
+/// 手書きでは「大きさだけが手掛かり」で親字と分離できないため、認識器は親字として返す。
+/// コードポイントの集合なのでソースに書いてよい (フォント名ではない)。
+let smallHiragana: Set<UInt32> = [
+    0x3041,  // ぁ
+    0x3043,  // ぃ
+    0x3045,  // ぅ
+    0x3047,  // ぇ
+    0x3049,  // ぉ
+    0x3063,  // っ
+    0x3083,  // ゃ
+    0x3085,  // ゅ
+    0x3087,  // ょ
+    0x308E,  // ゎ
+    0x3095,  // ゕ
+    0x3096,  // ゖ
+]
+
+/// 語彙から外す小書き片仮名 12 字。`smallHiragana` と対になる。
+let smallKatakana: Set<UInt32> = [
+    0x30A1,  // ァ
+    0x30A3,  // ィ
+    0x30A5,  // ゥ
+    0x30A7,  // ェ
+    0x30A9,  // ォ
+    0x30C3,  // ッ
+    0x30E3,  // ャ
+    0x30E5,  // ュ
+    0x30E7,  // ョ
+    0x30EE,  // ヮ
+    0x30F5,  // ヵ
+    0x30F6,  // ヶ
+]
 
 func buildVocabulary() -> VocabularyBuilder {
     var b = VocabularyBuilder()
@@ -92,12 +135,15 @@ func buildVocabulary() -> VocabularyBuilder {
     // latin-lower: U+0061-U+007A
     b.category(.latinLower) { $0.appendRange(0x61, 0x7A, context: "latin-lower") }
 
-    // hiragana: U+3041-U+3096
-    b.category(.hiragana) { $0.appendRange(0x3041, 0x3096, context: "hiragana") }
+    // hiragana: U+3041-U+3096 から小書き 12 字 (ぁぃぅぇぉっゃゅょゎゕゖ) を除いた 74 字
+    b.category(.hiragana) {
+        $0.appendRange(0x3041, 0x3096, excluding: smallHiragana, context: "hiragana")
+    }
 
-    // katakana: U+30A1-U+30FA, U+30FC (ー)
+    // katakana: U+30A1-U+30FA, U+30FC (ー) から小書き 12 字 (ァィゥェォッャュョヮヵヶ) を
+    // 除いた 79 字
     b.category(.katakana) {
-        $0.appendRange(0x30A1, 0x30FA, context: "katakana")
+        $0.appendRange(0x30A1, 0x30FA, excluding: smallKatakana, context: "katakana")
         $0.append(0x30FC, context: "katakana")
     }
 
@@ -205,6 +251,11 @@ func run() {
     }
     if covered != b.scalars.count {
         fail("区分の合計 \(covered) が総数 \(b.scalars.count) と一致しない")
+    }
+    // 小書き仮名 24 字が 1 つも残っていないこと (DESIGN.md §4)
+    let small = smallHiragana.union(smallKatakana)
+    for v in b.scalars where small.contains(v) {
+        fail("小書き仮名 U+\(String(v, radix: 16, uppercase: true)) が語彙に残っている")
     }
 
     // 出力先: 引数があればそれ、無ければパッケージ内の所定位置

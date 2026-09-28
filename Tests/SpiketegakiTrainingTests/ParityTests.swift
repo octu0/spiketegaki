@@ -220,18 +220,18 @@ final class ParityTests: XCTestCase {
         print("[Parity] readoutFrames 32 / 3 系列の最大絶対差 = \(worst)")
     }
 
-    // MARK: - 既定構成 (4 層 / hidden 512 / 出力 3236)
+    // MARK: - 既定構成 (4 層 / hidden 512 / 出力 3212)
 
     /// 実寸の回帰テスト。hidden や outputDim を変えたときに、
-    /// 3236 クラスでの誤差蓄積が 1e-3 を超えないことを自動で検出する。
+    /// 3212 クラスでの誤差蓄積が 1e-3 を超えないことを自動で検出する。
     /// (Wave 1 監査 §6-3 の指摘への対応)
     func testMLXAndCPULogitsAgreeAtDesignDefaultShape() throws {
         let designInputDim = 64
         let designHidden = 512
-        let designOutputDim = 3236
+        let designOutputDim = 3212
         let sequence = makeRandomSequence(inputDim: designInputDim, seed: 987654321)
         let worst = try runParity(
-            label: "4層/512/3236 readout8",
+            label: "4層/512/3212 readout8",
             numLayers: 4,
             inputDim: designInputDim,
             hidden: designHidden,
@@ -241,6 +241,6 @@ final class ParityTests: XCTestCase {
             sequences: [("random[0,1]", sequence)],
             mlxSeed: 987654321
         )
-        print("[Parity] 実寸構成 (4 層 / hidden 512 / 出力 3236) の最大絶対差 = \(worst)")
+        print("[Parity] 実寸構成 (4 層 / hidden 512 / 出力 3212) の最大絶対差 = \(worst)")
     }
 }

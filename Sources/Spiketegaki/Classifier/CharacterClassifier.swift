@@ -57,7 +57,7 @@ public final class CharacterClassifier: @unchecked Sendable {
         let k = min(topK, vocabulary.count)
         let probs = try probabilities(for: image)
 
-        // 語彙 3236 件に対し k は 5 程度なので、全体ソートより部分選択が安い
+        // 語彙数千件に対し k は 5 程度なので、全体ソートより部分選択が安い
         var order = [Int](repeating: 0, count: probs.count)
         var i = 0
         while i < probs.count {

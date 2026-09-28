@@ -28,8 +28,8 @@ final class CharacterVocabularyTests: XCTestCase {
     // MARK: - 総数と区分ごとの件数
 
     func testTotalCount() {
-        XCTAssertEqual(vocab.count, 3236)
-        XCTAssertEqual(CharacterTable.scalars.count, 3236)
+        XCTAssertEqual(vocab.count, 3212)
+        XCTAssertEqual(CharacterTable.scalars.count, 3212)
     }
 
     func testCategoryCountsMatchTheDesignTable() {
@@ -38,8 +38,8 @@ final class CharacterVocabularyTests: XCTestCase {
             (.asciiSymbols, 32),
             (.latinUpper, 26),
             (.latinLower, 26),
-            (.hiragana, 86),
-            (.katakana, 91),
+            (.hiragana, 74),
+            (.katakana, 79),
             (.kanjiLevel1, 2965)
         ]
         var total = 0
@@ -47,7 +47,7 @@ final class CharacterVocabularyTests: XCTestCase {
             XCTAssertEqual(vocab.range(of: category).count, count, "\(category.rawValue) の件数が表と違う")
             total += count
         }
-        XCTAssertEqual(total, 3236)
+        XCTAssertEqual(total, 3212)
         XCTAssertEqual(total, vocab.count)
     }
 
@@ -96,17 +96,33 @@ final class CharacterVocabularyTests: XCTestCase {
 
     func testHiraganaAndKatakana() {
         XCTAssertEqual(category(of: "あ"), .hiragana)
-        XCTAssertEqual(category(of: "ぁ"), .hiragana)
-        XCTAssertEqual(category(of: "ゖ"), .hiragana)
+        XCTAssertEqual(category(of: "ゔ"), .hiragana)
         XCTAssertEqual(category(of: "ア"), .katakana)
         // 長音符 (U+30FC) は katakana に入れる
         XCTAssertEqual(category(of: "ー"), .katakana)
         let k = vocab.range(of: .katakana)
-        XCTAssertEqual(vocab.character(at: k.lowerBound), "ァ")
+        XCTAssertEqual(vocab.character(at: k.lowerBound), "ア")
         XCTAssertEqual(vocab.character(at: k.upperBound - 1), "ー")
         let h = vocab.range(of: .hiragana)
-        XCTAssertEqual(vocab.character(at: h.lowerBound), "ぁ")
-        XCTAssertEqual(vocab.character(at: h.upperBound - 1), "ゖ")
+        XCTAssertEqual(vocab.character(at: h.lowerBound), "あ")
+        XCTAssertEqual(vocab.character(at: h.upperBound - 1), "ゔ")
+    }
+
+    /// 小書き仮名 24 字は語彙に無い (DESIGN.md §4、2026-09-28 決定)。
+    /// 手書きでは大きさだけが手掛かりで親字と分離できないため、認識器は親字として返す。
+    func testSmallKanaAreNotInTheVocabulary() {
+        let small: [Character] = Array("ぁぃぅぇぉっゃゅょゎゕゖァィゥェォッャュョヮヵヶ")
+        XCTAssertEqual(small.count, 24)
+        for c in small {
+            XCTAssertNil(indexByCharacter[c], "小書き \(c) が語彙に残っている")
+        }
+        // 対応する親字はすべて残っている
+        for c in Array("あいうえおつやゆよわかけアイウエオツヤユヨワカケ") {
+            XCTAssertNotNil(indexByCharacter[c], "親字 \(c) が語彙から消えている")
+        }
+        // ひらがな・カタカナの区分は小書きを抜いた 74 / 79 字
+        XCTAssertEqual(vocab.range(of: .hiragana).count, 86 - 12)
+        XCTAssertEqual(vocab.range(of: .katakana).count, 91 - 12)
     }
 
     func testKanjiFirstAndLast() {
@@ -153,8 +169,8 @@ final class CharacterVocabularyTests: XCTestCase {
         XCTAssertEqual(counts[.asciiSymbols], 32)
         XCTAssertEqual(counts[.latinUpper], 26)
         XCTAssertEqual(counts[.latinLower], 26)
-        XCTAssertEqual(counts[.hiragana], 86)
-        XCTAssertEqual(counts[.katakana], 91)
+        XCTAssertEqual(counts[.hiragana], 74)
+        XCTAssertEqual(counts[.katakana], 79)
         XCTAssertEqual(counts[.kanjiLevel1], 2965)
     }
 
@@ -238,7 +254,8 @@ final class CharacterVocabularyTests: XCTestCase {
     ///
     /// 区分の開始 index は §4 の件数の累積:
     ///   digits 0 / ascii-symbols 10 / latin-upper 42 / latin-lower 68 /
-    ///   hiragana 94 / katakana 180 / kanji-level1 271 (= 10+32+26+26+86+91)、末尾 3235。
+    ///   hiragana 94 / katakana 168 / kanji-level1 247 (= 10+32+26+26+74+79)、末尾 3211。
+    ///   (2026-09-28 に小書き仮名 24 字を語彙から外したので hiragana 86→74、katakana 91→79。)
     ///
     /// 漢字の 4 点 (唖 / 蔭 / 院 / 翠) は Python の `euc_jp` コーデックで JIS 0x3021–0x4F53 を
     /// 独立に列挙して求めた値で、リポジトリのコードは一切使っていない。
@@ -262,24 +279,24 @@ final class CharacterVocabularyTests: XCTestCase {
             // latin-lower (68–93)
             ("a", 68),
             ("z", 93),
-            // hiragana (94–179): U+3041–U+3096
-            ("ぁ", 94),      // U+3041 区分の先頭
-            ("あ", 95),      // U+3042
-            ("ん", 176),     // U+3093 = 94 + (0x3093 - 0x3041)
-            ("ゖ", 179),     // U+3096 区分の末尾
-            // katakana (180–270): U+30A1–U+30FA と U+30FC
-            ("ァ", 180),     // U+30A1 区分の先頭
-            ("ア", 181),     // U+30A2
-            ("ヺ", 269),     // U+30FA = 180 + (0x30FA - 0x30A1)
-            ("ー", 270),     // U+30FC 区分の末尾 (長音符は最後に足す)
-            // kanji-level1 (271–3235)
-            ("亜", 271),     // JIS 0x3021 区分の先頭
-            ("唖", 272),     // JIS 0x3022
-            ("蔭", 364),     // JIS 0x307E 区 16 の末尾 (271 + 93)
-            ("院", 365),     // JIS 0x3121 区 17 の先頭
-            ("翠", 1753),    // JIS 0x3F69
-            ("碗", 3234),    // JIS 0x4F52
-            ("腕", 3235)     // JIS 0x4F53 区分の末尾 = 語彙の末尾
+            // hiragana (94–167): U+3041–U+3096 から小書き 12 字を除いた 74 字
+            ("あ", 94),      // U+3042 区分の先頭 (ぁ U+3041 は外した)
+            ("い", 95),      // U+3044 (ぃ U+3043 は外した)
+            ("ん", 166),     // U+3093
+            ("ゔ", 167),     // U+3094 区分の末尾 (ゕ U+3095 / ゖ U+3096 は外した)
+            // katakana (168–246): U+30A1–U+30FA と U+30FC から小書き 12 字を除いた 79 字
+            ("ア", 168),     // U+30A2 区分の先頭 (ァ U+30A1 は外した)
+            ("イ", 169),     // U+30A4
+            ("ヺ", 245),     // U+30FA
+            ("ー", 246),     // U+30FC 区分の末尾 (長音符は最後に足す)
+            // kanji-level1 (247–3211)
+            ("亜", 247),     // JIS 0x3021 区分の先頭
+            ("唖", 248),     // JIS 0x3022
+            ("蔭", 340),     // JIS 0x307E 区 16 の末尾 (247 + 93)
+            ("院", 341),     // JIS 0x3121 区 17 の先頭
+            ("翠", 1729),    // JIS 0x3F69
+            ("碗", 3210),    // JIS 0x4F52
+            ("腕", 3211)     // JIS 0x4F53 区分の末尾 = 語彙の末尾
         ]
         XCTAssertGreaterThanOrEqual(table.count, 12)
 
@@ -296,9 +313,9 @@ final class CharacterVocabularyTests: XCTestCase {
             (.asciiSymbols, 10, 42),
             (.latinUpper, 42, 68),
             (.latinLower, 68, 94),
-            (.hiragana, 94, 180),
-            (.katakana, 180, 271),
-            (.kanjiLevel1, 271, 3236)
+            (.hiragana, 94, 168),
+            (.katakana, 168, 247),
+            (.kanjiLevel1, 247, 3212)
         ]
         for (category, lower, upper) in expected {
             XCTAssertEqual(vocab.range(of: category), lower ..< upper, "\(category.rawValue) の範囲が違う")
@@ -309,9 +326,9 @@ final class CharacterVocabularyTests: XCTestCase {
         XCTAssertEqual(vocab.category(of: 42), .latinUpper)
         XCTAssertEqual(vocab.category(of: 93), .latinLower)
         XCTAssertEqual(vocab.category(of: 94), .hiragana)
-        XCTAssertEqual(vocab.category(of: 270), .katakana)
-        XCTAssertEqual(vocab.category(of: 271), .kanjiLevel1)
-        XCTAssertEqual(vocab.category(of: 3235), .kanjiLevel1)
+        XCTAssertEqual(vocab.category(of: 246), .katakana)
+        XCTAssertEqual(vocab.category(of: 247), .kanjiLevel1)
+        XCTAssertEqual(vocab.category(of: 3211), .kanjiLevel1)
     }
 
     func testFreshInstanceMatchesShared() {

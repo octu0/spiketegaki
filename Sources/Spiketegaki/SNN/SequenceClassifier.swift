@@ -93,7 +93,7 @@ extension SpikingNetwork {
     /// 旧実装は `forward` の中でフレームごとに wOut (outputDim x maxHiddenDim) を掛けてから
     /// 32 フレーム分のロジットを平均していたが、先に rate を平均してから 1 回掛ければ同値で、
     /// **読み出しの仕事がフレーム数ぶんの 1 になる**。
-    /// 32 フレーム・隠れ 512・出力 3236 では読み出しが全演算の約 6 割を占めていた。
+    /// 32 フレーム・隠れ 512・出力 3236 (当時の語彙) では読み出しが全演算の約 6 割を占めていた。
     ///
     /// 浮動小数の丸めの順序は変わるので、旧実装とビット一致はしない。
     /// 差は `SNNTests.testReadoutOncePerCharacterMatchesPerFrameReadout` で測っていて、

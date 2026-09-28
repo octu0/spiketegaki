@@ -14,7 +14,7 @@ public enum ScriptCategory: String, Sendable, Equatable, CaseIterable {
 /// 並び順は学習済み重みと結びつくので固定。実体は `script/vocab` が生成した
 /// `CharacterTable` で、このコードは検索テーブルを組むだけ。
 public struct CharacterVocabulary: Sendable {
-    /// 毎回 3236 要素の配列を作らないための共有インスタンス。
+    /// 毎回数千要素の配列を作らないための共有インスタンス。
     public static let shared = CharacterVocabulary()
 
     private let characters: [Character]

@@ -9,9 +9,6 @@
     --bg: #f6f5f2;
     --panel: #ffffff;
     --line: #d8d4cc;
-    /* 十字 (中心の目安) は従、内枠 (em の目安) は主。内枠の方を濃くする */
-    --cross: #e6e3dc;
-    --guide: #c7c1b4;
     --ink: #1c1b18;
     --sub: #6b665d;
     --accent: #3b6ea5;
@@ -38,7 +35,11 @@
   }
   .card h2 { font-size: 0.8rem; margin: 0 0 10px; color: var(--sub); font-weight: 600; letter-spacing: .04em; }
 
-  /* マス目。枠・十字・内枠はすべて canvas の背景か外側の要素なので、描いた墨とは混ざらない */
+  /* 筆記領域。目安線 (中心線・内枠) は描かない。
+     枠があるとその内側に小さく書いてしまい、学習データ (フォントの em ボックスの
+     約 85% を字が占める) との大きさのずれで誤認識するため。大きさ・位置のずれは
+     ペンを離したあとの外接矩形クロップ (main.js) で吸収する。
+     境界が分かるよう薄い外枠だけ残す。 */
   #pad {
     display: block;
     width: 256px;
@@ -46,33 +47,8 @@
     touch-action: none;
     cursor: crosshair;
     background-color: #fff;
-    background-image:
-      linear-gradient(to right, transparent calc(50% - 1px), var(--cross) calc(50% - 1px), var(--cross) calc(50% + 1px), transparent calc(50% + 1px)),
-      linear-gradient(to bottom, transparent calc(50% - 1px), var(--cross) calc(50% - 1px), var(--cross) calc(50% + 1px), transparent calc(50% + 1px));
-    border: 2px solid var(--ink);
+    border: 1px solid var(--line);
     border-radius: 4px;
-  }
-
-  /* 内枠 (em の目安)。マス目の中央 85%。
-     フォントから作った学習データでは字の高さがマス目の 0.81〜0.88 に集まるので、
-     この枠いっぱいに書くと学習時と同じ大きさになる。小さく書くと小書き仮名 (ケ と ヶ など)
-     と見分けがつかなくなる。 */
-  #padFrame {
-    position: relative;
-    display: inline-block;
-    font-size: 0;
-  }
-  #padFrame::after {
-    content: "";
-    position: absolute;
-    /* canvas の枠 2px の内側がマス目そのもの。そこから中央 85% に縮める */
-    top: 2px;
-    right: 2px;
-    bottom: 2px;
-    left: 2px;
-    transform: scale(0.85);
-    border: 1px solid var(--guide);
-    pointer-events: none;
   }
   #preview {
     display: block;
@@ -98,6 +74,13 @@
   #status { font-size: 0.85rem; color: var(--sub); min-height: 1.6em; }
   #timing { font-variant-numeric: tabular-nums; font-size: 0.85rem; color: var(--sub); }
 
+  /* 筆幅スライダー。値は次の筆記から効く (描画済みの墨は変えない) */
+  #penRow label { font-size: 0.85rem; color: var(--sub); white-space: nowrap; }
+  #pen { flex: 1 1 100px; min-width: 90px; }
+  #penValue { font-variant-numeric: tabular-nums; font-size: 0.8rem; color: var(--sub); white-space: nowrap; }
+  #strokeWidth { margin: 10px 0 0; font-size: 0.85rem; font-variant-numeric: tabular-nums; }
+  .note { margin: 4px 0 0; font-size: 0.75rem; color: var(--sub); line-height: 1.5; }
+
   ol#results { list-style: none; margin: 0; padding: 0; min-width: 280px; }
   ol#results li {
     display: grid;
@@ -120,18 +103,23 @@
 <main>
   <h1>spiketegaki — SNN 手書き 1 文字認識 (wasm)</h1>
   <p class="lead">
-    <strong>内枠いっぱいに 1 文字書いてください。</strong>内枠は em の目安で、学習データの字の大きさに合わせてあります。
-    小さく書くと小書き仮名 (ケ と ヶ、よ と ょ) と見分けがつきません。ペンを離して 150 ms 後に自動で認識します。
+    <strong>枠の中に 1 文字書いてください (大きさ・位置は問いません)。</strong>ペンを離すと墨の外接矩形を切り出し、
+    学習データと同じ占有率 (長辺の 85%) に揃えてから認識します。ペンを離して 150 ms 後に自動で認識します。筆の太さは枠の下のスライダーで変えられます (次の筆記から反映)。
     推論は SwiftWasm でビルドした純 Swift の SNN が、このページの中で走ります。
   </p>
 
   <div class="columns">
     <div class="card">
-      <h2>マス目 (256 x 256) / 内枠 = em の目安</h2>
-      <div id="padFrame"><canvas id="pad" width="256" height="256"></canvas></div>
+      <h2>筆記領域 (256 x 256)</h2>
+      <canvas id="pad" width="256" height="256"></canvas>
       <div class="row">
         <button id="clear" type="button">クリア</button>
         <span id="timing"></span>
+      </div>
+      <div class="row" id="penRow">
+        <label for="pen">筆幅</label>
+        <input id="pen" type="range" min="6" max="24" step="1" value="10">
+        <span id="penValue">10 px</span>
       </div>
     </div>
 
@@ -141,12 +129,14 @@
     </div>
 
     <div class="card">
-      <h2>正規化結果 (32 x 32)</h2>
+      <h2>正規化結果 (32 x 32、クロップ後)</h2>
       <canvas id="preview" width="32" height="32"></canvas>
+      <p id="strokeWidth">線幅 (32px 換算): — px</p>
     </div>
   </div>
 
   <p id="status">読み込み中…</p>
+  <p class="note">線幅の推定式: <strong>線幅 = 2 ÷ (1 − 収縮後の墨画素数 ÷ 墨画素数)</strong> — 正規化後 32x32 の墨 (値 0.1 以上、孤立画素は除く) に 3x3 最小値フィルタを 1 回かけると幅が 2 画素減ることからの粗い逆算です。輪郭のアンチエイリアスを拾うぶん真値より 0.6〜1.0 画素ほど大きく出ます。細い線では下限が 2.0 画素で、それより細いかどうかは区別できません。外接矩形でクロップしてから 32x32 に落とすので、同じ筆幅でも小さく書くほどこの値は大きく出ます (スライダーの px は筆記領域 256px 上の値です)。学習データを同じ式で測ると拡張前で約 3.2〜3.8 画素です。</p>
 </main>
 <script type="module" src="main.js"></script>
 </body>

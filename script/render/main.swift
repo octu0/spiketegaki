@@ -254,14 +254,6 @@ enum FontOrigin {
     }
 }
 
-/// 小書き仮名 (捨て仮名)。拡張の拡縮範囲を通常字と分けるためだけに使う
-/// (DESIGN.md §7: 通常字 0.60〜1.15 / 小書き仮名 0.70〜1.00)。
-/// 語彙側 (`CharacterVocabulary`) には持たせない。render の拡張の都合でしかないため。
-/// 一覧は DESIGN.md §7 のとおり 24 字 (ひらがな 12 + カタカナ 12)。
-let smallKanaScalars: Set<Unicode.Scalar> = Set(
-    "ぁぃぅぇぉっゃゅょゎゕゖァィゥェォッャュョヮヵヶ".unicodeScalars
-)
-
 /// 読み込みに成功したフォント 1 つ。CTFont は不変で thread-safe なのでサイズ別に作り置きする。
 final class FontEntry: @unchecked Sendable {
     let postScriptName: String
@@ -621,10 +613,11 @@ enum GrayBitmap {
 /// 全書体を人間が目視確認するための一覧 PNG。
 /// データを増やす前に、豆腐・欠落・フォールバック・位置ずれをここで潰す。
 enum ContactSheet {
-    /// 確認用の固定文字列 (16 文字)。
-    /// 小書き仮名と親字 (ょ/よ)、濁点と半濁点 (ビ/ピ)、英大小文字 (c/C) を必ず含める。
+    /// 確認用の固定文字列 (15 文字)。
+    /// 濁点と半濁点 (ビ/ピ)、英大小文字 (c/C)、画数の多い字 (永/鬱) を必ず含める。
     /// マス目基準の正規化がこれらを区別できているかを 1 行で見るため。
-    static let probe: [Character] = Array("あいうえお永鬱Aa0ょよビピcC")
+    /// 小書き仮名 (ょ) は語彙から外した (DESIGN.md §4) ので親字 (よ) に置き換えてある。
+    static let probe: [Character] = Array("あいうえお永鬱Aa0よビピcC")
     /// 桝を描く em
     static let em = 36
     /// 32x32 を何倍に拡大して並べるか
@@ -899,7 +892,7 @@ func run() {
     let started = Date()
 
     // --- フォントの読み込み ---
-    // 数百〜数千ファイルになるので、被覆率の走査 (1 フォントあたり 3236 回のグリフ検索) を
+    // 数百〜数千ファイルになるので、被覆率の走査 (1 フォントあたり語彙数ぶんのグリフ検索) を
     // 並列化する。CTFont は不変で thread-safe。結果は後で名前順に並べ直すので決定的。
     var entries = [FontEntry]()
     var rejected = [(name: String, reason: String)]()
@@ -1268,14 +1261,9 @@ func run() {
                 }
                 stats.drawn += 1
                 batch.append((label: item.index, image: base))
-                // 拡縮の範囲だけクラスで分ける (小書き仮名は拡大しない)
-                let isSmallKana = smallKanaScalars.contains(item.scalar)
                 var a = 0
                 while a < options.augment {
-                    batch.append((
-                        label: item.index,
-                        image: augmenter.augment(base, smallKana: isSmallKana)
-                    ))
+                    batch.append((label: item.index, image: augmenter.augment(base)))
                     a += 1
                 }
             }

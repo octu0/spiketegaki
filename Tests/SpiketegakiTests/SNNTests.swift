@@ -561,14 +561,14 @@ final class SNNTests: XCTestCase {
 
     // MARK: - 推論時間の計測
 
-    /// 既定構成 (4 層・hidden 512・出力 3236・timeSteps 4) で
+    /// 既定構成 (4 層・hidden 512・出力 3212・timeSteps 4) で
     /// 1 文字 (32 フレーム) あたりの CPU 推論時間を測る。数値ゲートは設けず、記録だけする。
     func testMeasureCharacterInferenceTime() throws {
         let net = SpikingNetwork(
             numLayers: 4,
             inputDim: 64,
             maxHiddenDim: 512,
-            outputDim: 3236,
+            outputDim: 3212,
             timeSteps: 4,
             lifConfig: LIFConfig()
         )
@@ -593,7 +593,7 @@ final class SNNTests: XCTestCase {
         }
         let elapsedNs = DispatchTime.now().uptimeNanoseconds - start
         let msPerCharacter = Double(elapsedNs) / Double(iterations) / 1_000_000.0
-        print("[Benchmark] 4 層 / hidden 512 / 出力 3236 / 32 フレーム: \(msPerCharacter) ms / 文字 (\(iterations) 回平均)")
+        print("[Benchmark] 4 層 / hidden 512 / 出力 3212 / 32 フレーム: \(msPerCharacter) ms / 文字 (\(iterations) 回平均)")
         XCTAssertFalse(checksum.isNaN)
         XCTAssertGreaterThan(msPerCharacter, 0.0)
     }

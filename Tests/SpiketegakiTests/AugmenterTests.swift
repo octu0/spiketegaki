@@ -37,7 +37,7 @@ final class AugmenterTests: XCTestCase {
         return try CharacterImage(pixels: p)
     }
 
-    /// 中央の 6x6 の四角 (小書き仮名くらいの小さな字)
+    /// 中央の 6x6 の四角 (マス目に対してかなり小さな字)
     private func smallSquare() throws -> CharacterImage {
         return try filledSquare(from: 13, to: 19)
     }
@@ -172,15 +172,15 @@ final class AugmenterTests: XCTestCase {
 
     /// 既定値は設計書 §7 の拡張範囲と一致する。
     /// 平行移動 ±5px は 2026-09-25 に ±2px から広げたもの。
-    /// 拡縮は 0.85〜1.1 → 0.7〜1.15 → (2026-09-25) 通常字 0.60〜1.15 / 小書き仮名 0.70〜1.00。
+    /// 拡縮は 0.85〜1.1 → 0.7〜1.15 → (2026-09-25) 0.60〜1.15。
+    /// 小書き仮名を語彙から外した (2026-09-28) のでクラス別の範囲は持たず 1 本に戻した。
     /// 膨張 1〜2px (等確率) / 確率 0.6 も 2026-09-25 に 1px / 確率 1/3 から強化したもの。
     func testDefaultParametersMatchTheDesignedRanges() {
         let p = Augmenter.Parameters()
         XCTAssertEqual(p.shearRange, -0.3 ... 0.3)
         XCTAssertEqual(p.rotationDegreesRange, -10.0 ... 10.0)
         XCTAssertEqual(p.translationRange, -5.0 ... 5.0, "平行移動は ±5px")
-        XCTAssertEqual(p.scaleRange, 0.60 ... 1.15, "通常字の拡縮は 0.60〜1.15")
-        XCTAssertEqual(p.smallKanaScaleRange, 0.70 ... 1.00, "小書き仮名の拡縮は 0.70〜1.00")
+        XCTAssertEqual(p.scaleRange, 0.60 ... 1.15, "拡縮は 0.60〜1.15")
         XCTAssertEqual(p.thicknessProbability, 0.6, accuracy: 1e-7, "膨張の確率は 0.6")
         XCTAssertEqual(p.maxDilationPixels, 2, "膨張は 1〜2px の等確率")
         XCTAssertEqual(p.elasticAmplitude, 1.5)
@@ -189,7 +189,7 @@ final class AugmenterTests: XCTestCase {
         XCTAssertEqual(p.saltPepperProbability, 0.01)
     }
 
-    // MARK: - クラス別の拡縮範囲 (通常字 / 小書き仮名)
+    // MARK: - 拡縮範囲
 
     /// 拡縮の実効倍率を測るための土台。中央の 24x24 の塗り潰し。
     /// 1.15 倍でも 27.6px でマス目に収まるので、はみ出しで墨を失わない。
@@ -239,7 +239,6 @@ final class AugmenterTests: XCTestCase {
 
     /// 拡縮だけを効かせた拡張を `trials` 回まわし、見積もり倍率の (最小, 最大) を返す。
     private func measuredScales(
-        smallKana: Bool,
         seed: UInt64,
         trials: Int = 800
     ) throws -> (probe: CharacterImage, min: Float, max: Float) {
@@ -250,7 +249,7 @@ final class AugmenterTests: XCTestCase {
         var hi: Float = 0.0
         var i = 0
         while i < trials {
-            let s = scaleEstimate(aug.augment(probe, smallKana: smallKana), base: base)
+            let s = scaleEstimate(aug.augment(probe), base: base)
             if s < lo { lo = s }
             if s > hi { hi = s }
             i += 1
@@ -258,10 +257,10 @@ final class AugmenterTests: XCTestCase {
         return (probe, lo, hi)
     }
 
-    /// 通常字の実効倍率は 0.60〜1.15 に収まり、かつ両端まで使われる。
-    func testNormalCharacterScaleSpansSixtyToOneFifteen() throws {
-        let m = try measuredScales(smallKana: false, seed: 20260925)
-        print("[scale] 通常字 min=\(m.min) max=\(m.max)"
+    /// 実効倍率は 0.60〜1.15 に収まり、かつ両端まで使われる。
+    func testScaleSpansSixtyToOneFifteen() throws {
+        let m = try measuredScales(seed: 20260925)
+        print("[scale] min=\(m.min) max=\(m.max)"
             + " / 目盛り 0.60=\(referenceScale(m.probe, 0.60)) 1.15=\(referenceScale(m.probe, 1.15))")
         XCTAssertGreaterThanOrEqual(
             m.min, referenceScale(m.probe, 0.60) - 0.01, "0.60 より小さく縮んでいる"
@@ -277,69 +276,29 @@ final class AugmenterTests: XCTestCase {
         )
     }
 
-    /// 小書き仮名の実効倍率は 0.70〜1.00。**1.00 を超えて拡大しない**のがこの変更の眼目。
-    func testSmallKanaScaleIsNeverEnlargedBeyondOne() throws {
-        let m = try measuredScales(smallKana: true, seed: 20260925)
-        print("[scale] 小書き仮名 min=\(m.min) max=\(m.max)"
-            + " / 目盛り 0.70=\(referenceScale(m.probe, 0.70)) 1.00=\(referenceScale(m.probe, 1.00))")
-        XCTAssertLessThanOrEqual(
-            m.max, referenceScale(m.probe, 1.00) + 0.01, "小書き仮名が 1.00 を超えて拡大されている"
-        )
-        XCTAssertGreaterThanOrEqual(
-            m.min, referenceScale(m.probe, 0.70) - 0.01, "0.70 より小さく縮んでいる"
-        )
-        XCTAssertLessThanOrEqual(
-            m.min, referenceScale(m.probe, 0.72), "縮小側の下端 0.70 まで使われていない"
-        )
-        XCTAssertGreaterThanOrEqual(
-            m.max, referenceScale(m.probe, 0.98), "拡大側の上端 1.00 まで使われていない"
-        )
-    }
-
-    /// 同じ画像・同じ seed でも、小書き仮名の方が拡大されない。
-    /// 通常字の上端は小書き仮名の上端より確実に大きい。
-    func testSmallKanaNeverReachesTheNormalUpperBound() throws {
-        let normal = try measuredScales(smallKana: false, seed: 4649)
-        let small = try measuredScales(smallKana: true, seed: 4649)
-        XCTAssertGreaterThan(
-            normal.max, small.max,
-            "通常字の方が大きく拡大されていない (クラス分けが効いていない)"
-        )
-        XCTAssertLessThan(
-            normal.min, small.min,
-            "通常字の方が小さく縮んでいない (クラス分けが効いていない)"
-        )
-    }
-
-    /// 小書き仮名の上端 (1.00) は通常字の上端 (1.15) より下、下端 (0.70) は通常字の下端 (0.60) より上。
-    /// 「小さい = 小書き」という手掛かりを保つための非対称。
-    func testSmallKanaRangeIsNestedInsideTheNormalRange() {
-        let p = Augmenter.Parameters()
-        XCTAssertGreaterThan(
-            p.smallKanaScaleRange.lowerBound, p.scaleRange.lowerBound,
-            "小書き仮名の縮小側が通常字より広い"
-        )
-        XCTAssertLessThan(
-            p.smallKanaScaleRange.upperBound, p.scaleRange.upperBound,
-            "小書き仮名の拡大側が通常字より広い"
-        )
-    }
-
-    /// クラスで消費する乱数の個数が変わらない (どちらも拡縮で 1 個)。
-    /// ずれると、同じ seed でもクラスの並び順で以降の系列が変わってしまう。
-    func testScaleClassDoesNotShiftTheRandomSequence() throws {
-        let image = try sampleImage()
-        let a = Augmenter(seed: 98765)
-        let b = Augmenter(seed: 98765)
-        _ = a.augment(image, smallKana: false)
-        _ = b.augment(image, smallKana: true)
+    /// 拡縮は 1 本の範囲しか持たない。文字クラスによらず同じ範囲・同じ乱数系列になる
+    /// (2026-09-28 に小書き仮名を語彙から外し、クラス別の `smallKanaScaleRange` を削除した)。
+    /// 同じ seed の 2 つの Augmenter は、どの画像を通しても同じ倍率・同じ以降の系列になる。
+    func testScaleDoesNotDependOnTheCharacterClass() throws {
+        let probe = try scaleProbe()
+        let a = Augmenter(seed: 98765, parameters: scaleOnlyParameters)
+        let b = Augmenter(seed: 98765, parameters: scaleOnlyParameters)
+        let base = probe.inkSum
         var i = 0
-        while i < 8 {
+        while i < 16 {
             XCTAssertEqual(
-                a.nextUInt64(), b.nextUInt64(),
-                "\(i) 個目で乱数系列がずれた (クラスで乱数の消費数が変わっている)"
+                scaleEstimate(a.augment(probe), base: base),
+                scaleEstimate(b.augment(probe), base: base),
+                accuracy: 1e-6,
+                "\(i) 回目で倍率が食い違った"
             )
             i += 1
+        }
+        // 拡張後も乱数の位置が揃っている
+        var k = 0
+        while k < 8 {
+            XCTAssertEqual(a.nextUInt64(), b.nextUInt64(), "\(k) 個目で乱数系列がずれた")
+            k += 1
         }
     }
 

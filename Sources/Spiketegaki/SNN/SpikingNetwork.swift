@@ -38,7 +38,7 @@ public final class SpikingNetwork: @unchecked Sendable {
     public var bOut: [Float]           // [outputDim]
 
     /// `inputDim` はスキャンライン符号化のフレーム次元 (既定 64)。
-    /// `outputDim` は文字クラス数 (既定 3236)。
+    /// `outputDim` は文字クラス数 (既定 3212)。
     /// `readoutFrames` は分類ロジットに使う末尾フレーム数 (既定 32 = 全フレーム平均)。
     /// 末尾だけに絞ると実データでは劣る: kana 実験 (2026-09-24) の held-out 正解率は 32 で 63.8%、8 で 44.0%。
     /// 0 以下を渡しても投げず 1 に丸める。
@@ -46,7 +46,7 @@ public final class SpikingNetwork: @unchecked Sendable {
         numLayers: Int = 1,
         inputDim: Int = 64,
         maxHiddenDim: Int = 512,
-        outputDim: Int = 3236,
+        outputDim: Int = 3212,
         timeSteps: Int = 4,
         lifConfig: LIFConfig = LIFConfig(),
         readoutFrames: Int = 32
