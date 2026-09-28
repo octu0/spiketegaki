@@ -36,6 +36,10 @@ struct Options {
     var scripts: [ScriptCategory] = ScriptCategory.allCases
     var sizes: [Int] = [18, 36, 64]
     var augment = 0
+    /// 手書き調の書体一覧 (1 行 1 PostScript 名)。nil = 無効
+    var oversampleListPath: String?
+    /// 一覧にある書体の拡張枚数の倍率。1 = 無効 (既定)
+    var oversample = 1
     var seed: UInt64 = 20260924
     var limitPerClass = 0        // 0 = 無制限
     var listFonts = false
@@ -72,6 +76,30 @@ struct Options {
             if !name.isEmpty && !out.contains(name) {
                 out.append(name)
             }
+        }
+        return out
+    }
+
+    /// 手書き調の書体一覧を読む。1 行 1 PostScript 名、'#' 以降はコメント、空行は無視。
+    /// --oversample-list で明示指定されたファイルなので、読めなければエラー終了する
+    /// (黙って無効にすると「重み付けしたつもりのデータ」ができてしまうため)。
+    static func loadOversampleList(path: String) -> Set<String> {
+        guard let text = try? String(contentsOf: URL(fileURLWithPath: path), encoding: .utf8) else {
+            fail("--oversample-list のファイルを読めません: \(path)")
+        }
+        var out = Set<String>()
+        for rawLine in text.split(separator: "\n", omittingEmptySubsequences: false) {
+            var line = String(rawLine)
+            if let hash = line.firstIndex(of: "#") {
+                line = String(line[line.startIndex ..< hash])
+            }
+            let name = line.trimmingCharacters(in: .whitespaces)
+            if !name.isEmpty {
+                out.insert(name)
+            }
+        }
+        if out.isEmpty {
+            fail("--oversample-list に書体名が 1 つもありません: \(path)")
         }
         return out
     }
@@ -113,6 +141,8 @@ struct Options {
             case "--scripts":       o.scripts = parseScripts(next(a))
             case "--sizes":         o.sizes = parseSizes(next(a))
             case "--augment":       o.augment = parseInt(next(a), a, min: 0)
+            case "--oversample-list": o.oversampleListPath = next(a)
+            case "--oversample":    o.oversample = parseInt(next(a), a, min: 1)
             case "--seed":          o.seed = UInt64(parseInt(next(a), a, min: 0))
             case "--limit-per-class": o.limitPerClass = parseInt(next(a), a, min: 0)
             case "--workers":       o.workers = parseInt(next(a), a, min: 1)
@@ -204,6 +234,9 @@ func printUsage() {
       --scripts <a,b>         digits,ascii,latin,hiragana,katakana,kanji,all (既定 all)
       --sizes <a,b>           描画サイズ px (既定 18,36,64)
       --augment <N>           1 枚につき拡張を N 枚足す (既定 0)
+      --oversample-list <path> 手書き調の書体一覧 (1 行 1 PostScript 名、'#' 以降はコメント)。
+                              この一覧にある書体だけ拡張枚数を --oversample 倍にする (train 側のみ)
+      --oversample <n>        --oversample-list にある書体の拡張倍率 (既定 1 = 無効)
       --seed <n>              拡張の乱数シード (既定 20260924)
       --limit-per-class <n>   1 クラスあたりの最大サンプル数 (既定 0 = 無制限)
       --workers <n>           フォント単位の並列数 (既定 1。1 なら出力順まで決定的)
@@ -1136,6 +1169,23 @@ func run() {
         fail("eval 側のフォントが 0 です (--holdout-fonts が 1 つも一致しません)")
     }
 
+    // --- 手書き調の書体一覧 (--oversample-list) ---
+    // 一覧の名前は PostScript 名の完全一致で引く。ソースには書体名を持たない (DESIGN §1)。
+    let oversampleNames: Set<String> = options.oversampleListPath
+        .map { Options.loadOversampleList(path: $0) } ?? []
+    if let listPath = options.oversampleListPath {
+        let hitTrain = trainEntries.filter { oversampleNames.contains($0.postScriptName) }
+        let hitEval = evalEntries.filter { oversampleNames.contains($0.postScriptName) }
+        let matched = Set(hitTrain.map { $0.postScriptName }).union(hitEval.map { $0.postScriptName })
+        let missing = oversampleNames.subtracting(matched).sorted()
+        logLine("   --oversample-list \(listPath): 一覧 \(oversampleNames.count) 件 /"
+            + " train で一致 \(hitTrain.count) 件 (拡張 \(options.augment) -> \(options.augment * options.oversample))"
+            + " / eval で一致 \(hitEval.count) 件 (倍率は掛けない)")
+        if !missing.isEmpty {
+            logLine("   注意: 一覧にあるが読み込めたフォントに無い名前 \(missing.count) 件: \(missing.joined(separator: ", "))")
+        }
+    }
+
     // --- --contact-sheet: 目視確認シートを書いて終了する ---
     if let sheetDir = options.contactSheetDir {
         // ラベルの描画に使うフォントは system-fonts.txt の先頭。
@@ -1166,6 +1216,10 @@ func run() {
         print("dry-run: 何も書き込みません")
         print("対象フォント \(entries.count) 件 (train \(trainEntries.count) / eval \(evalEntries.count))")
         print("区分 \(options.scripts.map { $0.rawValue }.joined(separator: ",")) / サイズ \(options.sizes.map(String.init).joined(separator: ",")) / 拡張 \(options.augment)")
+        if options.oversampleListPath != nil {
+            let hit = trainEntries.filter { oversampleNames.contains($0.postScriptName) }
+            print("--oversample \(options.oversample) 倍の書体 (train) \(hit.count) 件: 拡張 \(options.augment) -> \(options.augment * options.oversample)")
+        }
         if options.holdoutFonts.isEmpty {
             print("--holdout-fonts の指定なし")
         } else {
@@ -1207,11 +1261,15 @@ func run() {
 
     logLine("== render: フォント \(entries.count) 件 (train \(trainEntries.count) / eval \(evalEntries.count))")
     logLine("   区分 \(options.scripts.map { $0.rawValue }.joined(separator: ",")) / サイズ \(options.sizes.map(String.init).joined(separator: ",")) / 拡張 \(options.augment) / workers \(options.workers)")
+    if options.oversampleListPath != nil {
+        let hit = trainEntries.filter { oversampleNames.contains($0.postScriptName) }.count
+        logLine("   手書き調 \(hit) 書体 (train) は拡張 \(options.augment * options.oversample) 枚 (--oversample \(options.oversample))")
+    }
 
     let statsBox = StatsBox()
 
     // 1 フォント分の生成。拡張の乱数シードはフォント固定なのでスレッドの割り当てに依存しない。
-    @Sendable func process(entry: FontEntry, fontIndex: Int, sink: SampleSink) {
+    @Sendable func process(entry: FontEntry, fontIndex: Int, augment: Int, sink: SampleSink) {
         let t0 = Date()
         var stats = FontStats()
         stats.font = entry.postScriptName
@@ -1227,7 +1285,7 @@ func run() {
             // 1 em 四方がマス目。em = 描画サイズ (18 / 36 / 64 px)
             let em = max(8, size)
             var batch = [(label: Int, image: CharacterImage)]()
-            batch.reserveCapacity(entry.drawable.count * (1 + options.augment))
+            batch.reserveCapacity(entry.drawable.count * (1 + augment))
 
             for item in entry.drawable {
                 if item.index < 0 || item.index >= vocabCount {
@@ -1262,7 +1320,7 @@ func run() {
                 stats.drawn += 1
                 batch.append((label: item.index, image: base))
                 var a = 0
-                while a < options.augment {
+                while a < augment {
                     batch.append((label: item.index, image: augmenter.augment(base)))
                     a += 1
                 }
@@ -1289,29 +1347,41 @@ func run() {
     }
 
     // --- 並列実行 (フォント単位。--workers で束ねる数を決める) ---
-    func runGroup(_ list: [FontEntry], offset: Int, sink: SampleSink) {
+    // 手書き調の書体は拡張枚数を --oversample 倍にする (train 側のみ。
+    // eval は held-out フォントの素の分布を測るので倍率を掛けない)
+    @Sendable func augmentCount(for entry: FontEntry, oversampled: Bool) -> Int {
+        if oversampled && oversampleNames.contains(entry.postScriptName) {
+            return options.augment * options.oversample
+        }
+        return options.augment
+    }
+
+    func runGroup(_ list: [FontEntry], offset: Int, oversampled: Bool, sink: SampleSink) {
         if list.isEmpty {
             return
         }
         let width = max(1, min(options.workers, list.count))
         if width == 1 {
             for (i, e) in list.enumerated() {
-                process(entry: e, fontIndex: offset + i, sink: sink)
+                process(entry: e, fontIndex: offset + i,
+                        augment: augmentCount(for: e, oversampled: oversampled), sink: sink)
             }
             return
         }
         DispatchQueue.concurrentPerform(iterations: width) { chunk in
             var i = chunk
             while i < list.count {
-                process(entry: list[i], fontIndex: offset + i, sink: sink)
+                let e = list[i]
+                process(entry: e, fontIndex: offset + i,
+                        augment: augmentCount(for: e, oversampled: oversampled), sink: sink)
                 i += width
             }
         }
     }
 
-    runGroup(trainEntries, offset: 0, sink: trainSink)
+    runGroup(trainEntries, offset: 0, oversampled: true, sink: trainSink)
     if let evalSink {
-        runGroup(evalEntries, offset: trainEntries.count, sink: evalSink)
+        runGroup(evalEntries, offset: trainEntries.count, oversampled: false, sink: evalSink)
     }
 
     // --- 後始末とメタ ---
