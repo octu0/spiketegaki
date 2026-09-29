@@ -22,11 +22,13 @@ WASM_TRIPLE := wasm32-unknown-wasip1
 WASM_CPU := bleeding-edge
 DEMO_DIR := .tmp/demo
 DEMO_PORT := 8080
+GAME_DIR := .tmp/demo_game
+GAME_PORT := 8081
 
 # 各 script への引数 (例: make render ARGS="--scripts hiragana")
 ARGS ?=
 
-.PHONY: all build test xbuild xtest xtrain vocab render recognize wasm demo clean help
+.PHONY: all build test xbuild xtest xtrain vocab render recognize wasm demo game game-test clean help
 
 all: build test
 
@@ -78,10 +80,25 @@ wasm:
 ## (先に make wasm と recognize --export-weights が要る)
 demo:
 	@mkdir -p $(DEMO_DIR)
-	cp demo/index.html demo/main.js $(DEMO_DIR)/
+	cp demo/index.html demo/main.js demo/recognizer.js $(DEMO_DIR)/
 	@test -f $(DEMO_DIR)/spiketegaki.wasm || echo "警告: $(DEMO_DIR)/spiketegaki.wasm がありません (make wasm)"
 	@test -f $(DEMO_DIR)/kana.stgw || echo "警告: $(DEMO_DIR)/kana.stgw がありません (recognize --export-weights)"
 	python3 -m http.server $(DEMO_PORT) --directory $(DEMO_DIR)
+
+## 書き取りゲームを $(GAME_DIR) に置いて http://localhost:$(GAME_PORT)/ で配信する
+## 認識器 (demo/recognizer.js) は js/ の隣に置く (main.js が ./recognizer.js を import する)
+game:
+	@mkdir -p $(GAME_DIR)/js
+	cp demo_game/index.html demo_game/style.css $(GAME_DIR)/
+	cp demo_game/js/*.js $(GAME_DIR)/js/
+	cp demo/recognizer.js $(GAME_DIR)/js/
+	@cp $(DEMO_DIR)/spiketegaki.wasm $(GAME_DIR)/ 2>/dev/null || echo "警告: $(DEMO_DIR)/spiketegaki.wasm がありません (make wasm)"
+	@cp $(DEMO_DIR)/kanji80.stgw $(GAME_DIR)/ 2>/dev/null || echo "警告: $(DEMO_DIR)/kanji80.stgw がありません (recognize --export-weights)"
+	python3 -m http.server $(GAME_PORT) --directory $(GAME_DIR)
+
+## 書き取りゲームの単体テスト (DOM 非依存の得点・出題・判定)
+game-test:
+	node --test demo_game/tests/*.test.mjs
 
 ## ビルド成果物のクリーン
 clean:
@@ -100,6 +117,8 @@ help:
 	@echo "  make recognize ARGS=\"...\"     - swift run -c release recognize"
 	@echo "  make wasm                     - SwiftWasm でビルドし $(DEMO_DIR)/spiketegaki.wasm を作る"
 	@echo "  make demo                     - デモを $(DEMO_DIR) に置いて localhost:$(DEMO_PORT) で配信"
+	@echo "  make game                     - 書き取りゲームを $(GAME_DIR) に置いて localhost:$(GAME_PORT) で配信"
+	@echo "  make game-test                - 書き取りゲームの単体テスト (node --test)"
 	@echo "  make clean                    - ビルド成果物をクリーン"
 	@echo ""
 	@echo "MLX を使う学習とテストは x 付き (make xtrain / make xtest) だけです。swift run では動きません。"

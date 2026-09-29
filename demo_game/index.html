@@ -1,0 +1,133 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>かきとりドリル</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<canvas id="bg" class="bg"></canvas>
+<canvas id="fx" class="fx"></canvas>
+
+<div id="shake" class="shake">
+
+  <!-- タイトル -->
+  <section id="screen-title" class="screen screen--on">
+    <div class="title">
+      <div id="titleMascot" class="mascot-slot mascot-slot--big"></div>
+      <h1 class="sticker sticker--tilt">かきとりドリル</h1>
+      <div class="card">
+        <p class="lead">よみを見て、かんじを 1 字 書こう。<br>小学 1 年の 80 字から 10 問。</p>
+        <p id="boot" class="boot">よみこみ中…</p>
+      </div>
+      <button id="startButton" class="big" type="button" disabled>はじめる</button>
+
+      <dl class="records card">
+        <div><dt>さいこう とくてん</dt><dd id="bestScore">0</dd></div>
+        <div><dt>さいこう ドパ</dt><dd id="bestDopa">0</dd></div>
+        <div><dt>さいこう コンボ</dt><dd id="bestCombo">0</dd></div>
+      </dl>
+
+      <div class="settings card">
+        <label class="setting">
+          <input id="soundToggle" type="checkbox" checked>
+          <span>おと</span>
+        </label>
+        <label class="setting setting--range">
+          <span>おんりょう</span>
+          <input id="volumeInput" type="range" min="0" max="100" step="1" value="50">
+          <output id="volumeValue">50</output>
+        </label>
+        <label class="setting setting--range">
+          <span>ふでの ふとさ</span>
+          <input id="penInput" type="range" min="6" max="24" step="1" value="10">
+          <output id="penValue">10</output>
+        </label>
+      </div>
+    </div>
+  </section>
+
+  <!-- プレイ -->
+  <section id="screen-play" class="screen">
+    <div class="hudwrap">
+      <header class="hud">
+        <div class="hud__item card"><span class="hud__label">とくてん</span><span id="scoreValue" class="hud__value">0</span></div>
+        <div class="hud__item card"><span class="hud__label">ドパ</span><span id="dopaValue" class="hud__value">0</span></div>
+        <div class="hud__item card"><span class="hud__label">コンボ</span><span id="comboValue" class="hud__value">0</span></div>
+        <div class="hud__item card"><span class="hud__label" id="progressLabel">もんだい</span><span id="progressValue" class="hud__value">1 / 10</span></div>
+      </header>
+      <div id="reach" class="reach">リーチ!</div>
+    </div>
+
+    <div class="meter"><div id="meterBar" class="meter__bar"></div></div>
+    <div class="timer"><div id="timerBar" class="timer__bar"></div></div>
+
+    <!-- あつめた字: ラウンドの 10 枠を空カードで見せ、正解した字が飛んできて埋まる -->
+    <div id="collected" class="collected"></div>
+
+    <div class="question card">
+      <div id="playMascot" class="mascot-slot"></div>
+      <div class="question__text">
+        <p id="questionReading" class="question__reading sticker">よみ</p>
+        <p id="questionWord" class="question__word">□</p>
+      </div>
+    </div>
+    <p id="questionHint" class="question__hint"></p>
+
+    <div class="stage">
+      <div class="padframe">
+        <div id="lights" class="lights"></div>
+        <div id="padwrap" class="padwrap">
+          <canvas id="pad" width="256" height="256"></canvas>
+          <canvas id="hintPad" width="256" height="256" class="hintpad"></canvas>
+          <div id="padFlash" class="flash"></div>
+          <div id="padWipe" class="wipe"></div>
+          <div id="hanamaru" class="hanamaru"></div>
+          <div id="verdict" class="verdict"></div>
+        </div>
+      </div>
+    </div>
+
+    <div class="controls">
+      <button id="clearButton" type="button">かきなおし</button>
+      <button id="passButton" type="button">パス</button>
+      <button id="quitButton" type="button" class="ghost">やめる</button>
+    </div>
+
+    <!-- 観客: 色違いの小さなマスコット。正解で波のように跳ね、誤答で驚く -->
+    <div id="audience" class="fans"></div>
+  </section>
+
+  <!-- 結果 -->
+  <section id="screen-result" class="screen">
+    <div class="result">
+      <div id="resultMascot" class="mascot-slot mascot-slot--big"></div>
+      <h2 id="resultTitle" class="sticker sticker--tilt">けっか</h2>
+      <p class="result__score sticker"><span id="resultScore">0</span><span class="unit">てん</span></p>
+      <dl class="records card">
+        <div><dt>ドパ</dt><dd id="resultDopa">0</dd></div>
+        <div><dt>さいだい コンボ</dt><dd id="resultCombo">0</dd></div>
+        <div><dt>せいかい</dt><dd id="resultCorrect">0</dd></div>
+        <div><dt>おしい</dt><dd id="resultClose">0</dd></div>
+      </dl>
+      <p id="resultBest" class="result__best"></p>
+      <div class="controls controls--result">
+        <button id="extraButton" class="big" type="button">エクストラへ (90 びょう)</button>
+        <button id="againButton" type="button">もう一回</button>
+        <button id="homeButton" type="button" class="ghost">おわる</button>
+      </div>
+    </div>
+  </section>
+
+</div>
+
+<div id="parade" class="parade"></div>
+<div id="flights" class="flights"></div>
+<div id="floats" class="floats"></div>
+<div id="banner" class="banner"></div>
+
+<script type="module" src="js/main.js"></script>
+</body>
+</html>

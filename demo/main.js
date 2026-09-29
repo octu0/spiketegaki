@@ -1,42 +1,48 @@
 // ブラウザから wasm の SNN を呼ぶデモ。
 //
-// WASI の最低限 (argv / stdout / clock) は @bjorn3/browser_wasi_shim が満たす。
-// 重みは STGW v1 のバイナリを fetch して、そのまま wasm の線形メモリに写す。
+// wasm の起動・重み読込・クロップ・薄墨ガード・分類は demo/recognizer.js に置いてある
+// (書き取りゲームと共有する)。ここはこのページの UI (筆記・表示・モード・筆幅) だけ。
 
 import {
-  WASI,
-  File,
-  OpenFile,
-  ConsoleStdout
-} from 'https://esm.sh/@bjorn3/browser_wasi_shim@0.3.0';
+  SIDE,
+  INK_THRESHOLD,
+  GUARD_EMPTY,
+  boot,
+  loadWeights,
+  readInk,
+  classify,
+  isReady
+} from './recognizer.js';
 
-const WASM_URL = 'spiketegaki.wasm';
-const WEIGHTS_URL = 'kana.stgw';
+// 読み込める重み。語彙は共通 (3212 クラス) なので wasm はそのままで、
+// stg_load_weights を呼び直すだけで差し替えられる。
+const WEIGHT_SETS = [
+  { id: 'kana',    label: 'かな',      url: 'kana.stgw' },
+  { id: 'kanji80', label: '漢字 80 字', url: 'kanji80.stgw' }
+];
+const WEIGHTS_KEY = 'spiketegaki.weights';
+const WEIGHTS_DEFAULT = 'kana';
 
-const SIDE = 32;          // 正規化後の一辺
 const PAD = 256;          // 筆記領域の一辺
 const TOP_K = 5;
-// 墨がマス目の長辺に占める割合。フォントから作った学習データでは字の高さが em ボックスの
-// 0.81〜0.88 に集まるので、クロップした墨をこの割合で正方形の中央に置くと学習時と同じ大きさになる。
-const INK_RATIO = 0.85;
-// クロップ後のマス目の最小の一辺。太い筆で小さく書くと外接矩形が 32 画素を下回り、
-// 拡大しても情報が増えないどころか筆の粒が拡大されるだけなので、そこで止める。
-const MIN_CELL = SIDE;
 // 筆幅 (筆記領域 256px 上の px)。
 // 32x32 換算の太さはクロップの倍率 (= 32 / マス目の一辺) 次第で、書いた大きさによって変わる。
 const PEN_MIN = 6;
 const PEN_MAX = 24;
 const PEN_DEFAULT = 10;
 const PEN_KEY = 'spiketegaki.penWidth';
+// 認識モード (区分マスク)。値は stg_classify の scriptMask で、0 = 全部。
+// bit0 digits / bit1 ascii / bit2 latinUpper / bit3 latinLower / bit4 hiragana / bit5 katakana / bit6 kanji
+const MODES = [
+  { id: 'all',      label: '全部',     mask: 0 },
+  { id: 'hiragana', label: 'ひらがな', mask: 1 << 4 },
+  { id: 'katakana', label: 'カタカナ', mask: 1 << 5 },
+  { id: 'alnum',    label: '英数',     mask: (1 << 0) | (1 << 1) | (1 << 2) | (1 << 3) },
+  { id: 'kanji',    label: '漢字',     mask: 1 << 6 }
+];
+const MODE_KEY = 'spiketegaki.scriptMode';
+const MODE_DEFAULT = 'all';
 const IDLE_MS = 150;      // ペンを離してから認識するまで
-// 薄墨ガード。クロップ**前**の筆記領域 (256px) 上の墨で判定する。
-// クロップは小さな墨も 32x32 いっぱいに拡大するので、正規化後の墨量では
-// 「点 1 つ」「短い線」を弾けない (拡大後は墨が十分に見えてしまう)。
-// 外接矩形の長辺と墨画素数の両方がこれらを満たさない入力は、文字として成立していない。
-const MIN_INK_SIDE = 24;      // 墨の外接矩形の長辺の下限 (筆記領域 256px 上の px)
-const MIN_INK_PIXELS = 300;   // 閾値を越えた墨画素数の下限
-// 墨とみなす下限 (0..255)。ImageNormalizer.inkThreshold = 0.1 と同じ (0.1 * 255 = 25.5 -> 26)
-const INK_THRESHOLD = 26;
 
 const pad = document.getElementById('pad');
 const preview = document.getElementById('preview');
@@ -47,6 +53,8 @@ const clearButton = document.getElementById('clear');
 const penInput = document.getElementById('pen');
 const penValue = document.getElementById('penValue');
 const strokeWidthLine = document.getElementById('strokeWidth');
+const modeSelect = document.getElementById('mode');
+const weightsSelect = document.getElementById('weights');
 
 const padCtx = pad.getContext('2d', { willReadFrequently: true });
 const previewCtx = preview.getContext('2d');
@@ -55,197 +63,57 @@ padCtx.lineCap = 'round';
 padCtx.lineJoin = 'round';
 padCtx.strokeStyle = '#1c1b18';
 
-// wasm 側の状態
-let wasm = null;          // { exports, inPtr, idxPtr, probPtr, normPtr }
 let drawing = false;
 let idleTimer = 0;
 let penWidth = loadPenWidth();   // 次の筆記から使う筆幅 (px)
+let modeId = loadMode();         // 認識モード (区分マスク) の id
+let weightsId = loadWeightsId(); // 読み込む重みの id
 
 function setStatus(text) {
   statusLine.textContent = text;
 }
 
-// MARK: - wasm の起動
+// MARK: - 起動
 
-async function boot() {
+async function start() {
   setStatus('wasm を読み込み中…');
-  // argv が空だと Swift のランタイム起動に失敗するので argv[0] を必ず渡す
-  const fds = [
-    new OpenFile(new File([])),
-    ConsoleStdout.lineBuffered((m) => console.log(m)),
-    ConsoleStdout.lineBuffered((m) => console.warn(m))
-  ];
-  const wasi = new WASI(['spiketegaki'], [], fds);
-
-  // python3 -m http.server が .wasm に application/wasm を返さない環境があるので
-  // instantiateStreaming ではなく arrayBuffer 経由で作る
-  const wasmBytes = await fetchArrayBuffer(WASM_URL);
-  const { instance } = await WebAssembly.instantiate(wasmBytes, {
-    wasi_snapshot_preview1: wasi.wasiImport
-  });
-  const code = wasi.start(instance);
-  if (code !== 0) {
-    throw new Error(`wasm の起動が ${code} で終了しました`);
-  }
-  const exports = instance.exports;
-
-  setStatus('重みを読み込み中…');
-  const weights = new Uint8Array(await fetchArrayBuffer(WEIGHTS_URL));
-  const weightsPtr = exports.stg_alloc(weights.length);
-  if (weightsPtr === 0) {
-    throw new Error('重みぶんのメモリを確保できませんでした');
-  }
-  new Uint8Array(exports.memory.buffer).set(weights, weightsPtr);
-  const rc = exports.stg_load_weights(weightsPtr, weights.length);
-  if (rc !== 0) {
-    throw new Error(`重みを読み込めませんでした (コード ${rc})`);
-  }
-
-  // 使い回すバッファを 1 回だけ確保する (解放する関数は無い)。
-  // クロップ後のマス目は最大で一辺 ceil(PAD / INK_RATIO) (墨が筆記領域いっぱいのとき)
-  const maxCell = Math.ceil(PAD / INK_RATIO);
-  wasm = {
-    exports,
-    inPtr: exports.stg_alloc(maxCell * maxCell),
-    idxPtr: exports.stg_alloc(TOP_K * 4),
-    probPtr: exports.stg_alloc(TOP_K * 4),
-    normPtr: exports.stg_alloc(SIDE * SIDE)
-  };
-  setStatus(`準備完了 (重み ${(weights.length / 1048576).toFixed(1)} MiB)。枠の中に 1 文字書いてください (大きさ・位置は問いません)。`);
-}
-
-async function fetchArrayBuffer(url) {
-  const res = await fetch(url);
-  if (!res.ok) {
-    throw new Error(`${url} を取得できませんでした (HTTP ${res.status})`);
-  }
-  return res.arrayBuffer();
+  await boot();
+  setStatus(`重み (${weightsLabelOf(weightsId)}) を読み込み中…`);
+  const bytes = await loadWeights(weightsUrlOf(weightsId));
+  setStatus(`準備完了 (重み ${weightsLabelOf(weightsId)} ${(bytes / 1048576).toFixed(1)} MiB)。枠の中に 1 文字書いてください (大きさ・位置は問いません)。`);
 }
 
 // MARK: - 認識
 
-/** 筆記領域の墨 (アルファ値) を 0 = 紙 / 255 = 墨 の並びで取り出す */
-function readInk() {
-  const data = padCtx.getImageData(0, 0, PAD, PAD).data;
-  const gray = new Uint8Array(PAD * PAD);
-  let sum = 0;
-  for (let i = 0; i < gray.length; i += 1) {
-    const a = data[i * 4 + 3];
-    gray[i] = a;
-    sum += a;
-  }
-  return { gray, sum };
-}
-
-// === crop:begin === (.tmp のオフライン検証がこの範囲をそのまま切り出して使う)
-/**
- * 墨の外接矩形を切り出して「1 マス目」に仕立てる。
- *
- * 枠 (中心線・内枠) を出すと人は枠の内側に小さく書いてしまい、フォント (em の約 85% を字が
- * 占める) との大きさのずれで誤認識する。小書き仮名は語彙に無いので大きさの情報は要らない。
- * そこで墨の外接矩形を取り、長辺 L が一辺の `inkRatio` を占めるような白い正方形
- * (一辺 S = ceil(L / inkRatio)、ただし `minCell` 未満にはしない) の中央に置く。
- *
- * `inkWidth` / `inkHeight` / `inkPixels` はクロップ**前**の筆記領域上の実寸で、
- * 薄墨ガード (呼び出し側) が「文字として成立しているか」を測るのに使う。
- *
- * @param {Uint8Array} gray 墨の濃さ (0 = 紙, 255 = 墨) の width * height 配列
- * @param {number} threshold 墨とみなす下限 (0..255)
- * @returns {{cell: Uint8Array, side: number, inkWidth: number, inkHeight: number, inkPixels: number}|null}
- *          しきい値を越える墨が 1 画素も無ければ null
- */
-function cropToCell(gray, width, height, threshold, inkRatio, minCell) {
-  let minX = width;
-  let minY = height;
-  let maxX = -1;
-  let maxY = -1;
-  let inkPixels = 0;
-  for (let y = 0; y < height; y += 1) {
-    for (let x = 0; x < width; x += 1) {
-      if (gray[y * width + x] < threshold) {
-        continue;
-      }
-      inkPixels += 1;
-      if (x < minX) { minX = x; }
-      if (x > maxX) { maxX = x; }
-      if (y < minY) { minY = y; }
-      if (y > maxY) { maxY = y; }
-    }
-  }
-  if (maxX < 0) {
-    return null;
-  }
-  const inkWidth = maxX - minX + 1;
-  const inkHeight = maxY - minY + 1;
-  const side = Math.max(minCell, Math.ceil(Math.max(inkWidth, inkHeight) / inkRatio));
-  // 0 = 紙 なので、確保したままが白地
-  const cell = new Uint8Array(side * side);
-  const offsetX = Math.floor((side - inkWidth) / 2);
-  const offsetY = Math.floor((side - inkHeight) / 2);
-  for (let y = 0; y < inkHeight; y += 1) {
-    for (let x = 0; x < inkWidth; x += 1) {
-      // しきい値未満の縁 (アンチエイリアス) も外接矩形の中なら濃さのまま写す
-      cell[(offsetY + y) * side + offsetX + x] = gray[(minY + y) * width + minX + x];
-    }
-  }
-  return { cell, side, inkWidth, inkHeight, inkPixels };
-}
-// === crop:end ===
-
 function recognize() {
-  if (!wasm) {
+  if (!isReady()) {
     return;
   }
-  const { gray, sum } = readInk();
-  const crop = sum === 0 ? null : cropToCell(gray, PAD, PAD, INK_THRESHOLD, INK_RATIO, MIN_CELL);
-  if (crop === null) {
-    showEmpty('まだ認識していません');
+  let result;
+  try {
+    result = classify(readInk(padCtx, PAD, PAD), PAD, PAD, TOP_K, maskOf(modeId));
+  } catch (error) {
+    setStatus(`エラー: ${error.message}`);
+    console.error(error);
+    return;
+  }
+  if (!result.ok) {
+    // 墨が無い / 点や短い線 (薄墨ガード)。どちらも候補は出さない
+    showEmpty(result.reason === GUARD_EMPTY
+      ? 'まだ認識していません'
+      : 'まだ認識していません (線が短すぎます)');
     timing.textContent = '';
     clearPreview();
     showStrokeWidth(null);
     return;
   }
 
-  // 薄墨ガード。クロップ前の実寸で見るので、点や短い線はここで止まる
-  if (Math.max(crop.inkWidth, crop.inkHeight) < MIN_INK_SIDE || crop.inkPixels < MIN_INK_PIXELS) {
-    showEmpty('まだ認識していません (線が短すぎます)');
-    timing.textContent = '';
-    clearPreview();
-    showStrokeWidth(null);
-    return;
-  }
+  showResults(result.rows);
+  timing.textContent = `推論 ${(result.micros / 1000).toFixed(1)} ms`;
 
-  const e = wasm.exports;
-  new Uint8Array(e.memory.buffer).set(crop.cell, wasm.inPtr);
-  const n = e.stg_classify(wasm.inPtr, crop.side, crop.side, TOP_K, wasm.idxPtr, wasm.probPtr);
-  if (n < 0) {
-    setStatus(`認識に失敗しました (コード ${n})`);
-    return;
-  }
-
-  // プレビューと線幅表示に使う 32x32 (薄墨の判定はクロップ前に済ませてある)
-  const normalized = e.stg_last_normalized(wasm.normPtr) === SIDE * SIDE
-    ? new Uint8Array(e.memory.buffer, wasm.normPtr, SIDE * SIDE)
-    : null;
-
-  const buffer = e.memory.buffer;
-  const indices = new Int32Array(buffer, wasm.idxPtr, n);
-  const probabilities = new Float32Array(buffer, wasm.probPtr, n);
-  const rows = [];
-  for (let i = 0; i < n; i += 1) {
-    rows.push({
-      char: String.fromCodePoint(e.stg_char(indices[i])),
-      probability: probabilities[i]
-    });
-  }
-  showResults(rows);
-
-  const micros = Number(e.stg_last_micros());
-  timing.textContent = `推論 ${(micros / 1000).toFixed(1)} ms`;
-
-  if (normalized !== null) {
-    drawPreview(normalized);
-    showStrokeWidth(estimateStrokeWidth(normalized));
+  if (result.normalized !== null) {
+    drawPreview(result.normalized);
+    showStrokeWidth(estimateStrokeWidth(result.normalized));
   }
 }
 
@@ -372,6 +240,130 @@ function showStrokeWidth(width) {
     : `線幅 (32px 換算): ${width.toFixed(1)} px`;
 }
 
+// MARK: - 認識モード (区分マスク)
+
+/** モード id から stg_classify に渡すビットマスク。知らない id は「全部」 */
+function maskOf(id) {
+  const mode = MODES.find((m) => m.id === id);
+  return mode === undefined ? 0 : mode.mask;
+}
+
+/** localStorage に覚えたモード。無い / 知らない値なら既定値 */
+function loadMode() {
+  let stored = null;
+  try {
+    stored = window.localStorage.getItem(MODE_KEY);
+  } catch (error) {
+    // プライベートウィンドウなどで localStorage が使えない場合は既定値で続ける
+    stored = null;
+  }
+  return MODES.some((m) => m.id === stored) ? stored : MODE_DEFAULT;
+}
+
+function saveMode(id) {
+  try {
+    window.localStorage.setItem(MODE_KEY, id);
+  } catch (error) {
+    // 保存できなくても認識には影響しない
+  }
+}
+
+function buildModeSelect() {
+  modeSelect.replaceChildren(...MODES.map((m) => {
+    const option = document.createElement('option');
+    option.value = m.id;
+    option.textContent = m.label;
+    return option;
+  }));
+  modeSelect.value = modeId;
+}
+
+modeSelect.addEventListener('change', () => {
+  modeId = MODES.some((m) => m.id === modeSelect.value) ? modeSelect.value : MODE_DEFAULT;
+  modeSelect.value = modeId;
+  saveMode(modeId);
+  // 直前の筆記 (canvas に残っている墨) をそのまま新しいモードで引き直す。
+  // 墨が無ければ recognize が「まだ認識していません」を出す
+  window.clearTimeout(idleTimer);
+  recognize();
+});
+
+buildModeSelect();
+
+// MARK: - 重みの切り替え
+
+function weightsUrlOf(id) {
+  const w = WEIGHT_SETS.find((x) => x.id === id);
+  return (w === undefined ? WEIGHT_SETS[0] : w).url;
+}
+
+function weightsLabelOf(id) {
+  const w = WEIGHT_SETS.find((x) => x.id === id);
+  return (w === undefined ? WEIGHT_SETS[0] : w).label;
+}
+
+/** localStorage に覚えた重み。無い / 知らない値なら既定値 (かな) */
+function loadWeightsId() {
+  let stored = null;
+  try {
+    stored = window.localStorage.getItem(WEIGHTS_KEY);
+  } catch (error) {
+    // プライベートウィンドウなどで localStorage が使えない場合は既定値で続ける
+    stored = null;
+  }
+  return WEIGHT_SETS.some((w) => w.id === stored) ? stored : WEIGHTS_DEFAULT;
+}
+
+function saveWeightsId(id) {
+  try {
+    window.localStorage.setItem(WEIGHTS_KEY, id);
+  } catch (error) {
+    // 保存できなくても認識には影響しない
+  }
+}
+
+function buildWeightsSelect() {
+  weightsSelect.replaceChildren(...WEIGHT_SETS.map((w) => {
+    const option = document.createElement('option');
+    option.value = w.id;
+    option.textContent = w.label;
+    return option;
+  }));
+  weightsSelect.value = weightsId;
+}
+
+weightsSelect.addEventListener('change', () => {
+  const next = WEIGHT_SETS.some((w) => w.id === weightsSelect.value)
+    ? weightsSelect.value
+    : WEIGHTS_DEFAULT;
+  weightsSelect.value = next;
+  if (!isReady()) {
+    // 起動前は切り替えても読み込む先が無い。選択だけ覚えておく
+    weightsId = next;
+    saveWeightsId(next);
+    return;
+  }
+  weightsSelect.disabled = true;
+  window.clearTimeout(idleTimer);
+  setStatus(`重み (${weightsLabelOf(next)}) を読み込み中…`);
+  loadWeights(weightsUrlOf(next)).then((bytes) => {
+    weightsId = next;
+    saveWeightsId(next);
+    setStatus(`重みを ${weightsLabelOf(next)} に切り替えました (${(bytes / 1048576).toFixed(1)} MiB)。`);
+    // 直前の筆記 (canvas に残っている墨) を新しい重みで引き直す
+    recognize();
+  }).catch((error) => {
+    // 失敗したら選択を元に戻す (読み込み済みの重みはそのまま使える)
+    weightsSelect.value = weightsId;
+    setStatus(`エラー: ${error.message}`);
+    console.error(error);
+  }).finally(() => {
+    weightsSelect.disabled = false;
+  });
+});
+
+buildWeightsSelect();
+
 // MARK: - 筆記
 
 /** ポインタ座標を canvas の画素座標に直す (CSS で拡縮されていてもずれない) */
@@ -479,7 +471,7 @@ penInput.addEventListener('input', () => {
 
 showPenWidth();
 
-boot().catch((error) => {
+start().catch((error) => {
   setStatus(`エラー: ${error.message}`);
   console.error(error);
 });

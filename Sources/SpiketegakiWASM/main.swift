@@ -13,7 +13,7 @@ import Spiketegaki
 /// 戻り値のエラーコード (負の値がエラー)。
 enum StatusCode {
     static let ok: Int32 = 0
-    /// 引数が不正 (null ポインタ、幅・高さ・長さが 0 以下、topK が 0 以下)
+    /// 引数が不正 (null ポインタ、幅・高さ・長さが 0 以下、topK が 0 以下、区分マスクに未定義のビット)
     static let invalidArgument: Int32 = -1
     /// 重みがまだ読み込まれていない
     static let weightsNotLoaded: Int32 = -2
@@ -25,6 +25,40 @@ enum StatusCode {
     static let classifyFailed: Int32 = -5
     /// 直前の分類結果がまだ無い
     static let noPreviousResult: Int32 = -6
+}
+
+/// `stg_classify` の区分マスク。ビットが立った区分だけを候補にする。
+/// 0 は「全部」。定義されていないビットが立っていたら不正な引数として弾く。
+enum ScriptMask {
+    /// bit0 digits / bit1 ascii / bit2 latinUpper / bit3 latinLower /
+    /// bit4 hiragana / bit5 katakana / bit6 kanji
+    static let bits: [(bit: Int32, category: ScriptCategory)] = [
+        (1 << 0, .digits),
+        (1 << 1, .asciiSymbols),
+        (1 << 2, .latinUpper),
+        (1 << 3, .latinLower),
+        (1 << 4, .hiragana),
+        (1 << 5, .katakana),
+        (1 << 6, .kanjiLevel1)
+    ]
+
+    static let all: Int32 = (1 << 7) - 1
+
+    /// マスクを区分の集合にする。全ビットが立っていれば 0 と同じ空集合 (= 全部)。
+    /// 未定義のビットが立っている / 負のときは nil。
+    static func categories(_ mask: Int32) -> Set<ScriptCategory>? {
+        if mask < 0 || (mask & ~all) != 0 {
+            return nil
+        }
+        if mask == 0 || mask == all {
+            return []
+        }
+        var out = Set<ScriptCategory>()
+        for entry in bits where (mask & entry.bit) != 0 {
+            out.insert(entry.category)
+        }
+        return out
+    }
 }
 
 /// プロセスに 1 つだけ持つ状態。
@@ -89,6 +123,9 @@ public func stg_load_weights(_ ptr: UnsafeRawPointer?, _ len: Int32) -> Int32 {
 
 /// マス目 1 つ分のグレースケール (width x height、0 = 紙、255 = 墨) を分類する。
 ///
+/// `scriptMask` は候補にする区分のビットマスク (`ScriptMask`)。0 なら全区分。
+/// 指定した区分の外は softmax の前に除かれるので、候補も確率もその区分の中だけになる。
+///
 /// `outIndex` に topK 個の Int32 クラス index、`outProb` に topK 個の Float 確率を書く。
 /// 戻り値は実際に書いた件数。負の値はエラー。
 @_cdecl("stg_classify")
@@ -97,6 +134,7 @@ public func stg_classify(
     _ width: Int32,
     _ height: Int32,
     _ topK: Int32,
+    _ scriptMask: Int32,
     _ outIndex: UnsafeMutableRawPointer?,
     _ outProb: UnsafeMutableRawPointer?
 ) -> Int32 {
@@ -104,6 +142,9 @@ public func stg_classify(
         return StatusCode.invalidArgument
     }
     if width <= 0 || height <= 0 || topK <= 0 {
+        return StatusCode.invalidArgument
+    }
+    guard let categories = ScriptMask.categories(scriptMask) else {
         return StatusCode.invalidArgument
     }
     guard let classifier = Demo.classifier else {
@@ -123,7 +164,7 @@ public func stg_classify(
         image = try ImageNormalizer.normalize(
             width: Int(width), height: Int(height), gray: pixels, invert: false
         )
-        top = try classifier.classify(image: image, topK: Int(topK))
+        top = try classifier.classify(image: image, topK: Int(topK), categories: categories)
     } catch {
         return StatusCode.classifyFailed
     }

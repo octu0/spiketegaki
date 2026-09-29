@@ -39,31 +39,64 @@ public final class CharacterClassifier: @unchecked Sendable {
     }
 
     /// softmax 後の確率。総和は 1。
-    public func probabilities(for image: CharacterImage) throws -> [Float] {
-        return CharacterClassifier.softmax(try logits(for: image))
+    ///
+    /// `categories` が空でなければ、その区分の外のロジットを `-infinity` にしてから
+    /// softmax を取る。区分外の確率はちょうど 0 になり、指定区分だけで総和が 1 になる。
+    public func probabilities(
+        for image: CharacterImage,
+        categories: Set<ScriptCategory> = []
+    ) throws -> [Float] {
+        return CharacterClassifier.softmax(
+            maskLogits(try logits(for: image), categories: categories)
+        )
+    }
+
+    /// 指定区分の外を `-infinity` に潰したロジット。空集合 (= 全部) はそのまま返す。
+    public func maskLogits(_ values: [Float], categories: Set<ScriptCategory>) -> [Float] {
+        if categories.isEmpty {
+            return values
+        }
+        var out = [Float](repeating: -.infinity, count: values.count)
+        for category in ScriptCategory.allCases where categories.contains(category) {
+            for index in vocabulary.range(of: category) {
+                out[index] = values[index]
+            }
+        }
+        return out
+    }
+
+    /// 指定区分が占める index を語彙順に並べたもの。空集合 (= 全部) は全 index。
+    private func candidateIndices(_ categories: Set<ScriptCategory>) -> [Int] {
+        if categories.isEmpty {
+            return Array(0 ..< vocabulary.count)
+        }
+        var out = [Int]()
+        for category in ScriptCategory.allCases where categories.contains(category) {
+            out.append(contentsOf: vocabulary.range(of: category))
+        }
+        return out
     }
 
     /// 確率の高い順に topK 件。
     ///
     /// - `topK <= 0` は `invalidTopK` を投げる (0 件を返すと呼び出し側の誤りが隠れるため)。
-    /// - `topK > vocabulary.count` は語彙数に丸める (存在する以上は返しようがないため)。
+    /// - `topK` が候補数を超えるときは候補数に丸める (存在する以上は返しようがないため)。
+    /// - `categories` が空なら全区分から選ぶ。指定したときはその区分の中だけから選び、
+    ///   確率も指定区分だけで正規化される (総和 1)。
     public func classify(
         image: CharacterImage,
-        topK: Int
+        topK: Int,
+        categories: Set<ScriptCategory> = []
     ) throws -> [(character: Character, index: Int, probability: Float)] {
         if topK <= 0 {
             throw CharacterClassifierError.invalidTopK(topK)
         }
-        let k = min(topK, vocabulary.count)
-        let probs = try probabilities(for: image)
+        let probs = try probabilities(for: image, categories: categories)
 
-        // 語彙数千件に対し k は 5 程度なので、全体ソートより部分選択が安い
-        var order = [Int](repeating: 0, count: probs.count)
-        var i = 0
-        while i < probs.count {
-            order[i] = i
-            i += 1
-        }
+        // 候補は指定区分の index だけ。マスク後の確率は 0 に潰れるが、
+        // 候補側を絞っておけば下位桁のアンダーフローで順序が揺れない
+        var order = candidateIndices(categories)
+        let k = min(topK, order.count)
         // 確率降順、同率は index 昇順 (決定的にするため)
         order.sort { a, b in
             if probs[a] == probs[b] {
@@ -91,12 +124,13 @@ public final class CharacterClassifier: @unchecked Sendable {
         height: Int,
         gray: [Float],
         invert: Bool,
-        topK: Int
+        topK: Int,
+        categories: Set<ScriptCategory> = []
     ) throws -> [(character: Character, index: Int, probability: Float)] {
         let image = try ImageNormalizer.normalize(
             width: width, height: height, gray: gray, invert: invert
         )
-        return try classify(image: image, topK: topK)
+        return try classify(image: image, topK: topK, categories: categories)
     }
 
     /// UInt8 グレースケール版。
@@ -105,12 +139,13 @@ public final class CharacterClassifier: @unchecked Sendable {
         height: Int,
         gray: [UInt8],
         invert: Bool,
-        topK: Int
+        topK: Int,
+        categories: Set<ScriptCategory> = []
     ) throws -> [(character: Character, index: Int, probability: Float)] {
         let image = try ImageNormalizer.normalize(
             width: width, height: height, gray: gray, invert: invert
         )
-        return try classify(image: image, topK: topK)
+        return try classify(image: image, topK: topK, categories: categories)
     }
 
     /// 数値的に安定な softmax (最大値を引いてから exp する)。

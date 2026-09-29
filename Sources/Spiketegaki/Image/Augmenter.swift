@@ -12,8 +12,13 @@
 /// 線を太らせる変形だけを持ち、細らせる変形は持たない。線の細さのばらつきは
 /// フォントのウェイト違い (Light / Thin など) で賄う。
 ///
-/// 膨張は 1〜2px の等確率で、確率 0.6 で起きる (2026-09-25 に 1px / 確率 1/3 から強化)。
-/// 手書きの線はキャンバス上で 32px 換算 2〜3px と太く、フォントの 1〜1.5px より太いため。
+/// 膨張は 1〜2px の等確率で、確率 0.3 で起きる (1px / 確率 1/3 → 1〜2px / 確率 0.6 → 0.3)。
+/// 2026-09-29 の線幅実測: マス目に切り出した手書き 14 枚の線幅は 32x32 上で中央値 3.28px
+/// (3x3 最小値フィルタの残存率 r から w = 2/(1-r) で推定)。同じ測り方で学習データは
+/// 確率 0.6 のとき中央値 4.28px、0.3 のとき 3.41px、膨張なしで 3.02px。
+/// 描画解像度 (em 36/64) で線を細らせる案も試したが、3x3 最小値フィルタは線幅を
+/// 両側から削るため 1 回で 32x32 換算 1.0〜1.8px 細くなり、墨がほぼ消えたサンプルが
+/// 7〜15% 出る (32x32 での収縮を 2026-09-24 に廃止したのと同じ失敗) ので採らない。
 ///
 /// 拡縮は 0.60〜1.15 の 1 本 (2026-09-25 の手書き誤認識調査: 手書きはフォントより
 /// マス目に対して小さく書かれる (高さ比 0.47〜0.72 に対し学習データの平均 0.80〜0.85) ため
@@ -29,7 +34,7 @@ public final class Augmenter: @unchecked Sendable {
         public var translationRange: ClosedRange<Float>
         /// 拡縮: 0.60〜1.15
         public var scaleRange: ClosedRange<Float>
-        /// 太さ: この確率で膨張する (残りは変化なし)
+        /// 太さ: この確率で膨張する (残りは変化なし)。既定 0.3
         public var thicknessProbability: Float
         /// 太さ: 膨張する場合の最大 px 数。1〜この値の等確率で選ぶ
         public var maxDilationPixels: Int
@@ -47,7 +52,7 @@ public final class Augmenter: @unchecked Sendable {
             rotationDegreesRange: ClosedRange<Float> = -10.0 ... 10.0,
             translationRange: ClosedRange<Float> = -5.0 ... 5.0,
             scaleRange: ClosedRange<Float> = 0.60 ... 1.15,
-            thicknessProbability: Float = 0.6,
+            thicknessProbability: Float = 0.3,
             maxDilationPixels: Int = 2,
             elasticAmplitude: Float = 1.5,
             elasticSigma: Float = 4.0,

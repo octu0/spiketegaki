@@ -4,8 +4,8 @@
 //
 // 使うファイル:
 //   .tmp/demo/spiketegaki.wasm         make wasm で作る
-//   .tmp/demo/kana.stgw                recognize --export-weights で作る
-//   .tmp/datasets/kana_eval.stgk       評価データ (label u16 + 1024 byte が count 個)
+//   .tmp/demo/kana.stgw                recognize --export-weights で作る (--stgw で差し替え)
+//   .tmp/datasets/kana_eval.stgk       評価データ (label u16 + 1024 byte が count 個。--dataset で差し替え)
 //
 // stgk の画素は「墨の濃さ」(0 = 紙, 255 = 墨) で、stg_classify が受け取る向きと同じなので
 // そのまま渡せる。
@@ -15,13 +15,13 @@ import { execFileSync } from 'node:child_process';
 import { WASI } from 'node:wasi';
 
 const WASM_PATH = '.tmp/demo/spiketegaki.wasm';
-const WEIGHTS_PATH = '.tmp/demo/kana.stgw';
-const DATASET_PATH = '.tmp/datasets/kana_eval.stgk';
+const DEFAULT_WEIGHTS_PATH = '.tmp/demo/kana.stgw';
+const DEFAULT_DATASET_PATH = '.tmp/datasets/kana_eval.stgk';
 // kana.stgw の書き出し元と同じ JSON でなければ 3 段一致 (MLX → CPU → wasm) の
 // 検証にならないので、--export-weights に渡した JSON と同じものを CPU 側に使う。
 // --json <パス> か環境変数 STGK_JSON_WEIGHTS で渡せる。省略時は下の既定
 // (.tmp/demo/kana.stgw を書き出した最新の最良重み) を使う。
-const DEFAULT_JSON_WEIGHTS_PATH = '.tmp/weights/kana_R15.json';
+const DEFAULT_JSON_WEIGHTS_PATH = '.tmp/weights/kana_R17.json';
 
 const STGK_HEADER = 16;
 const STGK_PIXELS = 32 * 32;
@@ -33,7 +33,9 @@ function parseArgs(argv) {
   const o = {
     limit: 50,
     cpu: true,
-    json: process.env.STGK_JSON_WEIGHTS || DEFAULT_JSON_WEIGHTS_PATH
+    json: process.env.STGK_JSON_WEIGHTS || DEFAULT_JSON_WEIGHTS_PATH,
+    stgw: DEFAULT_WEIGHTS_PATH,
+    dataset: DEFAULT_DATASET_PATH
   };
   for (let i = 0; i < argv.length; i += 1) {
     if (argv[i] === '--limit') {
@@ -42,26 +44,40 @@ function parseArgs(argv) {
     } else if (argv[i] === '--json') {
       o.json = argv[i + 1];
       i += 1;
+    } else if (argv[i] === '--stgw') {
+      o.stgw = argv[i + 1];
+      i += 1;
+    } else if (argv[i] === '--dataset') {
+      o.dataset = argv[i + 1];
+      i += 1;
     } else if (argv[i] === '--skip-cpu') {
       o.cpu = false;
     } else if (argv[i] === '--help' || argv[i] === '-h') {
-      console.log('node demo/check.mjs [--limit N] [--json <重み JSON>] [--skip-cpu]');
-      console.log(`  --json 省略時: ${DEFAULT_JSON_WEIGHTS_PATH} (環境変数 STGK_JSON_WEIGHTS でも指定できる)`);
+      console.log('node demo/check.mjs [--limit N] [--json <重み JSON>] [--stgw <重み STGW>] [--dataset <stgk>] [--skip-cpu]');
+      console.log(`  --json    省略時: ${DEFAULT_JSON_WEIGHTS_PATH} (環境変数 STGK_JSON_WEIGHTS でも指定できる)`);
+      console.log(`  --stgw    省略時: ${DEFAULT_WEIGHTS_PATH} (wasm に読ませるバイナリ重み)`);
+      console.log(`  --dataset 省略時: ${DEFAULT_DATASET_PATH}`);
       process.exit(0);
     }
   }
   if (!o.json) {
     throw new Error('--json に重み JSON のパスを渡してください');
   }
+  if (!o.stgw) {
+    throw new Error('--stgw に重みバイナリ (STGW) のパスを渡してください');
+  }
+  if (!o.dataset) {
+    throw new Error('--dataset にデータセット (stgk) のパスを渡してください');
+  }
   return o;
 }
 
 /** CPU 側の recognize --dataset を実際に回して top-1 / top-5 の件数を取り出す */
-function runCPURecognize(limit, jsonWeightsPath) {
+function runCPURecognize(limit, jsonWeightsPath, datasetPath) {
   const args = [
     'run', '-c', 'release', 'recognize',
     '--weights', jsonWeightsPath,
-    '--dataset', DATASET_PATH,
+    '--dataset', datasetPath,
     '--limit', String(limit)
   ];
   const out = execFileSync('swift', args, { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
@@ -74,13 +90,13 @@ function runCPURecognize(limit, jsonWeightsPath) {
 }
 
 /** stgk を読んでヘッダを検証し、サンプル配列を返す */
-function readDataset(buf, limit) {
+function readDataset(buf, limit, datasetPath) {
   if (buf.length < STGK_HEADER) {
-    throw new Error(`${DATASET_PATH}: ヘッダが足りません (${buf.length} バイト)`);
+    throw new Error(`${datasetPath}: ヘッダが足りません (${buf.length} バイト)`);
   }
   const magic = buf.toString('latin1', 0, 4);
   if (magic !== 'STGK') {
-    throw new Error(`${DATASET_PATH}: magic が STGK ではありません (${magic})`);
+    throw new Error(`${datasetPath}: magic が STGK ではありません (${magic})`);
   }
   const version = buf.readUInt32LE(4);
   const count = buf.readUInt32LE(8);
@@ -104,7 +120,7 @@ function readDataset(buf, limit) {
 }
 
 /** wasm を立ち上げ、重みを読み込む */
-async function boot() {
+async function boot(weightsPath) {
   // argv が空だと Swift のランタイム起動が 71 で失敗するので、必ず argv[0] を渡す
   const wasi = new WASI({ version: 'preview1', args: ['spiketegaki'], env: {}, returnOnExit: true });
   const module = await WebAssembly.compile(await readFile(WASM_PATH));
@@ -117,7 +133,7 @@ async function boot() {
   const e = instance.exports;
   const mem = () => new Uint8Array(e.memory.buffer);
 
-  const weights = await readFile(WEIGHTS_PATH);
+  const weights = await readFile(weightsPath);
   const wPtr = e.stg_alloc(weights.length);
   if (wPtr === 0) throw new Error('stg_alloc が失敗しました (重み)');
   mem().set(weights, wPtr);
@@ -126,8 +142,10 @@ async function boot() {
   return { e, mem, weightsBytes: weights.length };
 }
 
-/** 幅 w x 高さ h の墨マップ (Uint8Array) を分類して top-k を返す */
-function classify(ctx, gray, w, h) {
+/** 幅 w x 高さ h の墨マップ (Uint8Array) を分類して top-k を返す。
+    scriptMask は区分マスク (0 = 全部。bit0 digits / bit1 ascii / bit2 latinUpper /
+    bit3 latinLower / bit4 hiragana / bit5 katakana / bit6 kanji) */
+function classify(ctx, gray, w, h, scriptMask = 0) {
   const { e, mem } = ctx;
   if (!ctx.inPtr || ctx.inLen < gray.length) {
     ctx.inPtr = e.stg_alloc(gray.length);
@@ -140,7 +158,7 @@ function classify(ctx, gray, w, h) {
     ctx.normPtr = e.stg_alloc(SIDE * SIDE);
   }
   mem().set(gray, ctx.inPtr);
-  const n = e.stg_classify(ctx.inPtr, w, h, TOP_K, ctx.idxPtr, ctx.probPtr);
+  const n = e.stg_classify(ctx.inPtr, w, h, TOP_K, scriptMask, ctx.idxPtr, ctx.probPtr);
   if (n < 0) throw new Error(`stg_classify が ${n} を返しました`);
   const buf = e.memory.buffer;
   const idx = new Int32Array(buf, ctx.idxPtr, n);
@@ -200,13 +218,13 @@ function asciiPreview(bytes) {
 
 async function main() {
   const opts = parseArgs(process.argv.slice(2));
-  const ctx = await boot();
+  const ctx = await boot(opts.stgw);
   console.log(`wasm      : ${WASM_PATH}`);
-  console.log(`重み      : ${WEIGHTS_PATH} (${ctx.weightsBytes} バイト)`);
+  console.log(`重み      : ${opts.stgw} (${ctx.weightsBytes} バイト)`);
   console.log(`CPU 側重み: ${opts.json}`);
 
-  const { count, samples } = readDataset(await readFile(DATASET_PATH), opts.limit);
-  console.log(`データセット: ${DATASET_PATH} (全 ${count} 件のうち先頭 ${samples.length} 件)`);
+  const { count, samples } = readDataset(await readFile(opts.dataset), opts.limit, opts.dataset);
+  console.log(`データセット: ${opts.dataset} (全 ${count} 件のうち先頭 ${samples.length} 件)`);
 
   // ウォームアップ (1 件目で確保・分岐予測を温めてから計測する)
   classify(ctx, samples[0].pixels, SIDE, SIDE);
@@ -234,7 +252,7 @@ async function main() {
   if (opts.cpu) {
     console.log('');
     console.log('-- CPU (recognize) との照合 --');
-    const cpu = runCPURecognize(n, opts.json);
+    const cpu = runCPURecognize(n, opts.json, opts.dataset);
     console.log(`  ${cpu.command}`);
     console.log(`  CPU  top-1 ${cpu.top1.hit} / ${cpu.top1.total}   top-5 ${cpu.top5.hit} / ${cpu.top5.total}`);
     console.log(`  wasm top-1 ${top1} / ${n}   top-5 ${top5} / ${n}`);

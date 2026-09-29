@@ -36,10 +36,28 @@ struct Options {
     var scripts: [ScriptCategory] = ScriptCategory.allCases
     var sizes: [Int] = [18, 36, 64]
     var augment = 0
+    /// 漢字区分だけ別の描画サイズを使う。nil = --sizes と同じ
+    var kanjiSizes: [Int]?
+    /// 漢字区分だけ別の拡張枚数を使う。nil = --augment と同じ。
+    /// 指定したときは --oversample の倍率を掛けない (手書き調の重み付けはかな側の判断)
+    var kanjiAugment: Int?
+    /// 漢字区分の対象をこのファイルに書かれた字だけに絞る。nil = 漢字区分の全字
+    var kanjiListPath: String?
+    /// --kanji-list で読んだ字のスカラ。nil = 絞り込みなし
+    var kanjiAllowed: Set<Unicode.Scalar>?
     /// 手書き調の書体一覧 (1 行 1 PostScript 名)。nil = 無効
     var oversampleListPath: String?
     /// 一覧にある書体の拡張枚数の倍率。1 = 無効 (既定)
     var oversample = 1
+    /// 漢字区分の拡張で線を太らせる確率。0 = 膨張なし (既定)。
+    /// 画数が多い字は 32x32 で隣り合う画が融合して塊になるので、既定では太らせない
+    var kanjiDilate: Float = 0.0
+    /// 漢字区分の拡張で膨張する場合の最大 px 数。かな等の 2px より狭くする
+    static let kanjiMaxDilation = 1
+    /// 漢字区分に使うフォントのウェイト上限 (kCTFontWeightTrait の正規化値)。
+    /// これを超える face は漢字を描かない (かな等には従来どおり使う)。
+    /// 既定 0.35 は Bold 0.4 以上を外し、SemiBold 0.3 までを残す
+    var kanjiMaxWeight: Double = 0.5
     var seed: UInt64 = 20260924
     var limitPerClass = 0        // 0 = 無制限
     var listFonts = false
@@ -47,10 +65,29 @@ struct Options {
     var listFacesTSV: String?    // 重複排除前の全 face (ファイル -> PostScript 名) を書き出す
     var dryRun = false           // フォントの解決と train/eval の振り分けだけ出して書き込まない
     var contactSheetDir: String? // 全書体の目視確認シートの出力先
+    var probe: [Character]?      // コンタクトシートの確認文字列。nil = 既定
     var maxFonts = 0             // 0 = 無制限
     var fontFilter: String?      // PostScript 名 / ファイル名にかける正規表現
     var requireScripts: [ScriptCategory] = []   // この区分のグリフを持つフォントだけ使う
     var workers = 1
+
+    /// 描画に使う全サイズ (--sizes と --kanji-sizes の和集合、昇順)。
+    /// フォントの作り置きと本体のループはこれを回し、桝ごとに区分で振り分ける。
+    var allSizes: [Int] {
+        var out = sizes
+        for s in kanjiSizes ?? [] where !out.contains(s) {
+            out.append(s)
+        }
+        return out.sorted()
+    }
+
+    /// 区分ごとの描画サイズ。
+    func sizes(for category: ScriptCategory) -> [Int] {
+        if category == .kanjiLevel1, let k = kanjiSizes {
+            return k
+        }
+        return sizes
+    }
 
     /// OS 付属フォントの一覧を書いたファイルの名前。
     /// フォント名をソースに直書きしないため、実体は <fonts-dir>/ に置く。
@@ -104,6 +141,53 @@ struct Options {
         return out
     }
 
+    /// --kanji-list の字を読む。1 行 1 字 (1 行に複数書いてもよい)、'#' 以降はコメント、空白は無視。
+    /// 明示指定されたファイルなので、読めない・空・語彙に無い字が混じる場合はエラー終了する
+    /// (黙って無視すると「絞ったつもりのデータ」ができてしまうため)。
+    static func loadKanjiList(path: String) -> Set<Unicode.Scalar> {
+        guard let text = try? String(contentsOf: URL(fileURLWithPath: path), encoding: .utf8) else {
+            fail("--kanji-list のファイルを読めません: \(path)")
+        }
+        let vocab = CharacterVocabulary.shared
+        let kanjiRange = vocab.range(of: .kanjiLevel1)
+        var kanji = Set<Character>()
+        var idx = kanjiRange.lowerBound
+        while idx < kanjiRange.upperBound {
+            kanji.insert(vocab.character(at: idx))
+            idx += 1
+        }
+        let all = Set(vocab.allCharacters)
+
+        var out = Set<Unicode.Scalar>()
+        var unknown = [Character]()
+        var notKanji = [Character]()
+        for rawLine in text.split(separator: "\n", omittingEmptySubsequences: false) {
+            var line = String(rawLine)
+            if let hash = line.firstIndex(of: "#") {
+                line = String(line[line.startIndex ..< hash])
+            }
+            for c in line where !c.isWhitespace {
+                if kanji.contains(c) {
+                    out.insert(c.unicodeScalars.first!)
+                } else if all.contains(c) {
+                    if !notKanji.contains(c) { notKanji.append(c) }
+                } else {
+                    if !unknown.contains(c) { unknown.append(c) }
+                }
+            }
+        }
+        if !unknown.isEmpty {
+            fail("--kanji-list に語彙に無い字が \(unknown.count) 件あります: \(String(unknown))  (\(path))")
+        }
+        if !notKanji.isEmpty {
+            fail("--kanji-list に漢字区分でない字が \(notKanji.count) 件あります: \(String(notKanji))  (\(path))")
+        }
+        if out.isEmpty {
+            fail("--kanji-list に字が 1 つもありません: \(path)")
+        }
+        return out
+    }
+
     static let scriptAliases: [String: ScriptCategory] = [
         "digits": .digits,
         "ascii": .asciiSymbols,
@@ -141,8 +225,13 @@ struct Options {
             case "--scripts":       o.scripts = parseScripts(next(a))
             case "--sizes":         o.sizes = parseSizes(next(a))
             case "--augment":       o.augment = parseInt(next(a), a, min: 0)
+            case "--kanji-sizes":   o.kanjiSizes = parseSizes(next(a))
+            case "--kanji-augment": o.kanjiAugment = parseInt(next(a), a, min: 0)
+            case "--kanji-list":    o.kanjiListPath = next(a)
             case "--oversample-list": o.oversampleListPath = next(a)
             case "--oversample":    o.oversample = parseInt(next(a), a, min: 1)
+            case "--kanji-dilate":  o.kanjiDilate = parseProbability(next(a), a)
+            case "--kanji-max-weight": o.kanjiMaxWeight = parseWeight(next(a), a)
             case "--seed":          o.seed = UInt64(parseInt(next(a), a, min: 0))
             case "--limit-per-class": o.limitPerClass = parseInt(next(a), a, min: 0)
             case "--workers":       o.workers = parseInt(next(a), a, min: 1)
@@ -154,6 +243,7 @@ struct Options {
             case "--list-faces-tsv": o.listFacesTSV = next(a)
             case "--dry-run":       o.dryRun = true
             case "--contact-sheet": o.contactSheetDir = next(a)
+            case "--probe":         o.probe = parseProbe(next(a))
             case "--help", "-h":    printUsage(); exit(0)
             default:
                 fail("未知の引数: \(a)  (--help を見てください)")
@@ -165,6 +255,12 @@ struct Options {
         }
         if o.scripts.isEmpty {
             fail("--scripts が空です")
+        }
+        if let k = o.kanjiSizes, k.isEmpty {
+            fail("--kanji-sizes が空です")
+        }
+        if let path = o.kanjiListPath {
+            o.kanjiAllowed = loadKanjiList(path: path)
         }
         return o
     }
@@ -182,6 +278,21 @@ struct Options {
         return v
     }
 
+    private static func parseProbability(_ s: String, _ flag: String) -> Float {
+        guard let v = Float(s), v >= 0.0, v <= 1.0 else {
+            fail("\(flag) には 0.0〜1.0 の確率を渡してください: \(s)")
+        }
+        return v
+    }
+
+    /// kCTFontWeightTrait の正規化値 (-1.0〜1.0)。Regular 0 / Bold 0.4 / Black 0.8
+    private static func parseWeight(_ s: String, _ flag: String) -> Double {
+        guard let v = Double(s), v >= -1.0, v <= 1.0 else {
+            fail("\(flag) には -1.0〜1.0 の正規化ウェイトを渡してください: \(s)")
+        }
+        return v
+    }
+
     private static func parseSizes(_ s: String) -> [Int] {
         var out = [Int]()
         for part in splitList(s) {
@@ -191,6 +302,15 @@ struct Options {
             out.append(v)
         }
         return out
+    }
+
+    /// コンタクトシートの確認文字列。1 文字も無ければエラー (空のシートを黙って出さない)。
+    private static func parseProbe(_ s: String) -> [Character] {
+        let chars = Array(s)
+        if chars.isEmpty {
+            fail("--probe が空です")
+        }
+        return chars
     }
 
     private static func parseScripts(_ s: String) -> [ScriptCategory] {
@@ -234,9 +354,23 @@ func printUsage() {
       --scripts <a,b>         digits,ascii,latin,hiragana,katakana,kanji,all (既定 all)
       --sizes <a,b>           描画サイズ px (既定 18,36,64)
       --augment <N>           1 枚につき拡張を N 枚足す (既定 0)
+      --kanji-sizes <a,b>     漢字区分だけ別の描画サイズにする (既定 = --sizes と同じ)
+      --kanji-augment <N>     漢字区分だけ別の拡張枚数にする (既定 = --augment と同じ)。
+                              指定すると漢字には --oversample の倍率を掛けない
+      --kanji-list <path>     漢字区分の対象をこのファイルに書かれた字だけに絞る
+                              (1 行 1 字、'#' 以降はコメント)。語彙に無い字・漢字でない字があればエラー
       --oversample-list <path> 手書き調の書体一覧 (1 行 1 PostScript 名、'#' 以降はコメント)。
                               この一覧にある書体だけ拡張枚数を --oversample 倍にする (train 側のみ)
       --oversample <n>        --oversample-list にある書体の拡張倍率 (既定 1 = 無効)
+      --kanji-dilate <p>      漢字区分の拡張で線を太らせる確率 (0.0〜1.0、既定 0 = 膨張なし)。
+                              膨張量は最大 \(Options.kanjiMaxDilation)px。かな等の区分は従来どおり
+                              (確率 0.3 / 最大 2px)。画数の多い字が塊になるのを防ぐ
+      --kanji-max-weight <w>  漢字区分に使うフォントのウェイト上限 (kCTFontWeightTrait の正規化値。
+                              既定 0.5。Thin -0.4 / Light -0.23 / Regular 0 / Medium 0.2 /
+                              SemiBold 0.3 / Bold 0.4 / ExtraBold 0.6 / Black 0.8)。
+                              既定では ExtraBold 以上を外し Bold までを使う
+                              (Bold も外すと書体が 19 減り、精度が下がることを実測した)。
+                              これを超える face は漢字を描かない (かな等には従来どおり使う)
       --seed <n>              拡張の乱数シード (既定 20260924)
       --limit-per-class <n>   1 クラスあたりの最大サンプル数 (既定 0 = 無制限)
       --workers <n>           フォント単位の並列数 (既定 1。1 なら出力順まで決定的)
@@ -247,7 +381,9 @@ func printUsage() {
       --list-fonts            読み込めたフォントと被覆率を表示して終了
       --list-fonts-tsv <path> --list-fonts のとき TSV を書き出す先 (既定 .tmp/reports/fonts_list.tsv)
       --contact-sheet <dir>   読み込めた全書体の目視確認シート (PNG) を書き出して終了する。
-                              固定の確認文字列を 1 行に並べ、40 書体で 1 ページ
+                              確認文字列を 1 行に並べ、40 書体で 1 ページ。
+                              描く em は --sizes と --kanji-sizes の値 (既定 18,36,64)。em ごとに別ファイル
+      --probe <文字列>        コンタクトシートの確認文字列 (既定は濁点・英大小・画数の多い字を含む 15 字)
       --dry-run               フォントの解決と train / eval の振り分けだけ表示し、
                               データセットを一切書かずに終了する
       --list-faces-tsv <path> PostScript 名で重複排除する前の全 face (path と名前) を書き出して終了
@@ -294,21 +430,25 @@ final class FontEntry: @unchecked Sendable {
     let fontsBySize: [Int: CTFont]
     /// 区分ごとの (描けるグリフ数, 語彙上の総数)
     let coverage: [ScriptCategory: (have: Int, total: Int)]
-    /// 実際に描ける文字の (クラス index, スカラ)。--scripts で絞った後の集合。
-    let drawable: [(index: Int, scalar: Unicode.Scalar)]
+    /// 実際に描ける文字の (クラス index, スカラ, 区分)。--scripts で絞った後の集合。
+    let drawable: [(index: Int, scalar: Unicode.Scalar, category: ScriptCategory)]
+    /// --kanji-max-weight を超えたので漢字を描かなかったか
+    let kanjiExcludedByWeight: Bool
 
     init(
         postScriptName: String,
         origin: FontOrigin,
         fontsBySize: [Int: CTFont],
         coverage: [ScriptCategory: (have: Int, total: Int)],
-        drawable: [(index: Int, scalar: Unicode.Scalar)]
+        drawable: [(index: Int, scalar: Unicode.Scalar, category: ScriptCategory)],
+        kanjiExcludedByWeight: Bool
     ) {
         self.postScriptName = postScriptName
         self.origin = origin
         self.fontsBySize = fontsBySize
         self.coverage = coverage
         self.drawable = drawable
+        self.kanjiExcludedByWeight = kanjiExcludedByWeight
     }
 }
 
@@ -333,6 +473,17 @@ enum FontLoader {
         return !glyphs.isEmpty
     }
 
+    /// ウェイト (kCTFontWeightTrait の正規化値)。Regular 0 / Bold 0.4 / Black 0.8。
+    /// 取れないフォントは Regular 扱い (0.0) にする。可変フォントの名前付きインスタンスも
+    /// 記述子ごとに別の CTFont なので、そのインスタンスの値が返る。
+    static func weight(_ font: CTFont) -> Double {
+        let traits = CTFontCopyTraits(font) as NSDictionary
+        guard let n = traits[kCTFontWeightTrait as String] as? NSNumber else {
+            return 0.0
+        }
+        return n.doubleValue
+    }
+
     static func glyph(_ font: CTFont, _ scalar: Unicode.Scalar) -> CGGlyph? {
         var utf16 = Array(String(Character(scalar)).utf16)
         var glyphs = [CGGlyph](repeating: 0, count: utf16.count)
@@ -349,7 +500,9 @@ enum FontLoader {
     static func loadSystem(
         _ psName: String,
         sizes: [Int],
-        scripts: [ScriptCategory]
+        scripts: [ScriptCategory],
+        kanjiAllowed: Set<Unicode.Scalar>?,
+        kanjiMaxWeight: Double
     ) -> FontLoadOutcome {
         let probe = CTFontCreateWithName(psName as CFString, CGFloat(sizes[0]), nil)
         let actual = CTFontCopyPostScriptName(probe) as String
@@ -360,7 +513,8 @@ enum FontLoader {
         for s in sizes {
             fonts[s] = CTFontCreateWithName(psName as CFString, CGFloat(s), nil)
         }
-        return .loaded(makeEntry(psName: psName, origin: .system, fonts: fonts, scripts: scripts))
+        return .loaded(makeEntry(psName: psName, origin: .system, fonts: fonts, scripts: scripts,
+                                 kanjiAllowed: kanjiAllowed, kanjiMaxWeight: kanjiMaxWeight))
     }
 
     /// ファイルから読む。記述子から作ったフォントの URL が元ファイルと一致することを確かめ、
@@ -368,7 +522,9 @@ enum FontLoader {
     static func loadFile(
         _ url: URL,
         sizes: [Int],
-        scripts: [ScriptCategory]
+        scripts: [ScriptCategory],
+        kanjiAllowed: Set<Unicode.Scalar>?,
+        kanjiMaxWeight: Double
     ) -> [FontLoadOutcome] {
         guard let descriptors = CTFontManagerCreateFontDescriptorsFromURL(url as CFURL) as? [CTFontDescriptor],
               !descriptors.isEmpty else {
@@ -392,7 +548,8 @@ enum FontLoader {
             for s in sizes {
                 fonts[s] = CTFontCreateWithFontDescriptor(desc, CGFloat(s), nil)
             }
-            out.append(.loaded(makeEntry(psName: psName, origin: .file(url), fonts: fonts, scripts: scripts)))
+            out.append(.loaded(makeEntry(psName: psName, origin: .file(url), fonts: fonts, scripts: scripts,
+                                         kanjiAllowed: kanjiAllowed, kanjiMaxWeight: kanjiMaxWeight)))
         }
         return out
     }
@@ -401,12 +558,17 @@ enum FontLoader {
         psName: String,
         origin: FontOrigin,
         fonts: [Int: CTFont],
-        scripts: [ScriptCategory]
+        scripts: [ScriptCategory],
+        kanjiAllowed: Set<Unicode.Scalar>?,
+        kanjiMaxWeight: Double
     ) -> FontEntry {
         let vocab = CharacterVocabulary.shared
         let probeFont = fonts.values.first!
         var coverage = [ScriptCategory: (have: Int, total: Int)]()
-        var drawable = [(index: Int, scalar: Unicode.Scalar)]()
+        var drawable = [(index: Int, scalar: Unicode.Scalar, category: ScriptCategory)]()
+        // 太いウェイトは em 64 で描いても隣り合う画が融合して塊になるので、漢字だけ対象から外す。
+        // 判定は数値トレイトだけで行う (書体名では判定しない)
+        let heavyForKanji = weight(probeFont) > kanjiMaxWeight
 
         for category in ScriptCategory.allCases {
             let range = vocab.range(of: category)
@@ -417,20 +579,26 @@ enum FontLoader {
                 let scalar = c.unicodeScalars.first!
                 if hasGlyph(probeFont, scalar) {
                     have += 1
-                    if scripts.contains(category) {
-                        drawable.append((index: idx, scalar: scalar))
+                    // --kanji-list を指定したときは漢字区分だけ一覧の字に絞る。
+                    // coverage は絞らない (--require-script と被覆表はフォント自体の被覆を見るため)
+                    let inScope = category != .kanjiLevel1
+                        || (!heavyForKanji && kanjiAllowed?.contains(scalar) ?? true)
+                    if scripts.contains(category) && inScope {
+                        drawable.append((index: idx, scalar: scalar, category: category))
                     }
                 }
                 idx += 1
             }
             coverage[category] = (have: have, total: range.count)
         }
+        let hasKanji = (coverage[.kanjiLevel1]?.have ?? 0) > 0
         return FontEntry(
             postScriptName: psName,
             origin: origin,
             fontsBySize: fonts,
             coverage: coverage,
-            drawable: drawable
+            drawable: drawable,
+            kanjiExcludedByWeight: heavyForKanji && hasKanji
         )
     }
 }
@@ -646,13 +814,11 @@ enum GrayBitmap {
 /// 全書体を人間が目視確認するための一覧 PNG。
 /// データを増やす前に、豆腐・欠落・フォールバック・位置ずれをここで潰す。
 enum ContactSheet {
-    /// 確認用の固定文字列 (15 文字)。
+    /// 確認用の既定の文字列 (15 文字)。--probe で差し替えられる。
     /// 濁点と半濁点 (ビ/ピ)、英大小文字 (c/C)、画数の多い字 (永/鬱) を必ず含める。
     /// マス目基準の正規化がこれらを区別できているかを 1 行で見るため。
-    /// 小書き仮名 (ょ) は語彙から外した (DESIGN.md §4) ので親字 (よ) に置き換えてある。
-    static let probe: [Character] = Array("あいうえお永鬱Aa0よビピcC")
-    /// 桝を描く em
-    static let em = 36
+    /// 小書き仮名 (ょ) は語彙から外したので親字 (よ) に置き換えてある。
+    static let defaultProbe: [Character] = Array("あいうえお永鬱Aa0よビピcC")
     /// 32x32 を何倍に拡大して並べるか
     static let scale = 4
     /// 1 ページあたりの書体数
@@ -669,27 +835,42 @@ enum ContactSheet {
         case blank
     }
 
-    /// 書体一覧を複数ページの PNG に書き出し、ページ数を返す。
-    static func write(entries: [FontEntry], directory: String, labelFont: CTFont) throws -> Int {
+    /// 書体一覧を em ごとに複数ページの PNG に書き出し、書いたページ数を返す。
+    static func write(
+        entries: [FontEntry],
+        directory: String,
+        labelFont: CTFont,
+        probe: [Character],
+        ems: [Int]
+    ) throws -> Int {
         let dir = URL(fileURLWithPath: directory)
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
 
         let sorted = entries.sorted { $0.postScriptName < $1.postScriptName }
-        let pageCount = max(1, (sorted.count + rowsPerPage - 1) / rowsPerPage)
-        var page = 0
-        while page < pageCount {
-            let slice = Array(sorted.dropFirst(page * rowsPerPage).prefix(rowsPerPage))
-            let url = dir.appendingPathComponent(String(format: "sheet_%02d.png", page + 1))
-            try writePage(slice, to: url, labelFont: labelFont, page: page + 1, of: pageCount)
-            page += 1
+        let pagesPerEm = max(1, (sorted.count + rowsPerPage - 1) / rowsPerPage)
+        var written = 0
+        for em in ems {
+            var page = 0
+            while page < pagesPerEm {
+                let slice = Array(sorted.dropFirst(page * rowsPerPage).prefix(rowsPerPage))
+                let url = dir.appendingPathComponent(
+                    String(format: "sheet_em%02d_%02d.png", em, page + 1)
+                )
+                try writePage(slice, to: url, labelFont: labelFont, probe: probe, em: em,
+                              page: page + 1, of: pagesPerEm)
+                written += 1
+                page += 1
+            }
         }
-        return pageCount
+        return written
     }
 
     private static func writePage(
         _ fonts: [FontEntry],
         to url: URL,
         labelFont: CTFont,
+        probe: [Character],
+        em: Int,
         page: Int,
         of pageCount: Int
     ) throws {
@@ -740,7 +921,7 @@ enum ContactSheet {
             for (col, ch) in probe.enumerated() {
                 let x = CGFloat(labelWidth + col * cellPx)
                 let rect = CGRect(x: x, y: bottom, width: CGFloat(cellPx), height: CGFloat(cellPx))
-                switch state(of: ch, font: font) {
+                switch state(of: ch, font: font, em: em) {
                 case .noGlyph:
                     ctx.setFillColor(red: 0.78, green: 0.78, blue: 0.78, alpha: 1)
                     ctx.fill(rect)
@@ -775,7 +956,7 @@ enum ContactSheet {
         }
     }
 
-    private static func state(of ch: Character, font: CTFont) -> CellState {
+    private static func state(of ch: Character, font: CTFont, em: Int) -> CellState {
         guard let scalar = ch.unicodeScalars.first, ch.unicodeScalars.count == 1 else {
             return .noGlyph
         }
@@ -984,13 +1165,17 @@ func run() {
         while i < totalToLoad {
             if i < targetSystemNames.count {
                 let psName = targetSystemNames[i]
-                switch FontLoader.loadSystem(psName, sizes: options.sizes, scripts: options.scripts) {
+                switch FontLoader.loadSystem(psName, sizes: options.allSizes, scripts: options.scripts,
+                                             kanjiAllowed: options.kanjiAllowed,
+                                             kanjiMaxWeight: options.kanjiMaxWeight) {
                 case .loaded(let e):  collector.addLoaded(e)
                 case .rejected(let w): collector.addRejected(psName, w)
                 }
             } else {
                 let url = targetFileURLs[i - targetSystemNames.count]
-                for r in FontLoader.loadFile(url, sizes: options.sizes, scripts: options.scripts) {
+                for r in FontLoader.loadFile(url, sizes: options.allSizes, scripts: options.scripts,
+                                             kanjiAllowed: options.kanjiAllowed,
+                                             kanjiMaxWeight: options.kanjiMaxWeight) {
                     switch r {
                     case .loaded(let e):  collector.addLoaded(e)
                     case .rejected(let w): collector.addRejected(url.lastPathComponent, w)
@@ -1049,6 +1234,10 @@ func run() {
         seenPSNames.insert(e.postScriptName)
         entries.append(e)
     }
+
+    // --kanji-max-weight でウェイト超過のため漢字を描かない face の数。
+    // 漢字だけが対象のときはこの後の「グリフ 0」フィルタで消えるので、落とす前に数える
+    let kanjiExcludedByWeight = entries.filter { $0.kanjiExcludedByWeight }.count
 
     // 対象区分のグリフを 1 つも持たないフォントは自動でスキップする
     // (Latin 専用フォントに --scripts hiragana を指定した場合など)。
@@ -1169,6 +1358,24 @@ func run() {
         fail("eval 側のフォントが 0 です (--holdout-fonts が 1 つも一致しません)")
     }
 
+    // 漢字の描き方の 1 行要約 (ログと --dry-run で共用)。対象区分に漢字が無ければ出さない
+    func kanjiOverrideLine() -> String? {
+        if !options.scripts.contains(.kanjiLevel1) {
+            return nil
+        }
+        let sz = options.sizes(for: .kanjiLevel1).map(String.init).joined(separator: ",")
+        let ag = options.kanjiAugment ?? options.augment
+        let note = options.kanjiAugment == nil ? "" : " (--oversample の倍率は掛けない)"
+        var line = "   漢字: サイズ \(sz) / 拡張 \(ag)\(note)"
+            + " / 膨張 確率 \(options.kanjiDilate) 最大 \(Options.kanjiMaxDilation)px (--kanji-dilate)"
+        line += "\n   --kanji-max-weight \(options.kanjiMaxWeight):"
+            + " ウェイト超過で漢字を描かない face \(kanjiExcludedByWeight) 件 (かな等には使う)"
+        if let allowed = options.kanjiAllowed, let path = options.kanjiListPath {
+            line += "\n   --kanji-list \(path): 対象 \(allowed.count) 字"
+        }
+        return line
+    }
+
     // --- 手書き調の書体一覧 (--oversample-list) ---
     // 一覧の名前は PostScript 名の完全一致で引く。ソースには書体名を持たない (DESIGN §1)。
     let oversampleNames: Set<String> = options.oversampleListPath
@@ -1198,13 +1405,16 @@ func run() {
                 labelFont = candidate
             }
         }
+        let probe = options.probe ?? ContactSheet.defaultProbe
         do {
             let pages = try ContactSheet.write(
-                entries: entries, directory: sheetDir, labelFont: labelFont
+                entries: entries, directory: sheetDir, labelFont: labelFont,
+                probe: probe, ems: options.allSizes
             )
             print("コンタクトシート: \(entries.count) 書体 / \(pages) ページ -> \(sheetDir)")
-            print("  確認文字列: \(String(ContactSheet.probe)) (\(ContactSheet.probe.count) 文字)")
-            print("  桝: em \(ContactSheet.em)px で描き マス目基準で 32x32 にした画像 を \(ContactSheet.scale) 倍")
+            print("  確認文字列: \(String(probe)) (\(probe.count) 文字)")
+            print("  桝: em \(options.allSizes.map(String.init).joined(separator: ","))px で描き"
+                + " マス目基準で 32x32 にした画像 を \(ContactSheet.scale) 倍 (em ごとに別ファイル)")
         } catch {
             fail("コンタクトシートを書けません: \(error)")
         }
@@ -1216,6 +1426,9 @@ func run() {
         print("dry-run: 何も書き込みません")
         print("対象フォント \(entries.count) 件 (train \(trainEntries.count) / eval \(evalEntries.count))")
         print("区分 \(options.scripts.map { $0.rawValue }.joined(separator: ",")) / サイズ \(options.sizes.map(String.init).joined(separator: ",")) / 拡張 \(options.augment)")
+        if let line = kanjiOverrideLine() {
+            print(line.trimmingCharacters(in: .whitespaces))
+        }
         if options.oversampleListPath != nil {
             let hit = trainEntries.filter { oversampleNames.contains($0.postScriptName) }
             print("--oversample \(options.oversample) 倍の書体 (train) \(hit.count) 件: 拡張 \(options.augment) -> \(options.augment * options.oversample)")
@@ -1261,6 +1474,9 @@ func run() {
 
     logLine("== render: フォント \(entries.count) 件 (train \(trainEntries.count) / eval \(evalEntries.count))")
     logLine("   区分 \(options.scripts.map { $0.rawValue }.joined(separator: ",")) / サイズ \(options.sizes.map(String.init).joined(separator: ",")) / 拡張 \(options.augment) / workers \(options.workers)")
+    if let line = kanjiOverrideLine() {
+        logLine(line)
+    }
     if options.oversampleListPath != nil {
         let hit = trainEntries.filter { oversampleNames.contains($0.postScriptName) }.count
         logLine("   手書き調 \(hit) 書体 (train) は拡張 \(options.augment * options.oversample) 枚 (--oversample \(options.oversample))")
@@ -1269,26 +1485,51 @@ func run() {
     let statsBox = StatsBox()
 
     // 1 フォント分の生成。拡張の乱数シードはフォント固定なのでスレッドの割り当てに依存しない。
-    @Sendable func process(entry: FontEntry, fontIndex: Int, augment: Int, sink: SampleSink) {
+    // oversampled = train 側 (手書き調の倍率を掛けてよい側) かどうか。
+    @Sendable func process(entry: FontEntry, fontIndex: Int, oversampled: Bool, sink: SampleSink) {
         let t0 = Date()
         var stats = FontStats()
         stats.font = entry.postScriptName
         stats.origin = entry.origin.shortLabel
 
         let augmenter = Augmenter(seed: options.seed &+ UInt64(fontIndex) &* 0x9E3779B97F4A7C15)
+        // 漢字は画数が多く、32x32 に縮めた後で膨張させると隣り合う画が融合して塊になる。
+        // 膨張の確率 (既定 0) と最大 px を漢字だけ別のパラメータにする。乱数も別系列
+        let kanjiAugmenter = Augmenter(
+            seed: options.seed &+ 0xA5A5_5A5A &+ UInt64(fontIndex) &* 0x2545F4914F6CDD1D,
+            parameters: Augmenter.Parameters(
+                thicknessProbability: options.kanjiDilate,
+                maxDilationPixels: Options.kanjiMaxDilation
+            )
+        )
         let vocabCount = vocab.count
 
-        for size in options.sizes {
+        // 区分ごとの拡張枚数。--kanji-augment を指定した漢字には --oversample の倍率を掛けない
+        // (手書き調の重み付けはかな側の判断なので漢字に持ち込まない)。
+        let handwriting = oversampled && oversampleNames.contains(entry.postScriptName)
+        func augmentCount(_ category: ScriptCategory) -> Int {
+            if category == .kanjiLevel1, let n = options.kanjiAugment {
+                return n
+            }
+            return handwriting ? options.augment * options.oversample : options.augment
+        }
+        let maxAugment = ScriptCategory.allCases.map { augmentCount($0) }.max() ?? 0
+
+        for size in options.allSizes {
             guard let font = entry.fontsBySize[size] else {
                 continue
             }
-            // 1 em 四方がマス目。em = 描画サイズ (18 / 36 / 64 px)
+            // 1 em 四方がマス目。em = 描画サイズ (--sizes / --kanji-sizes で指定した px)
             let em = max(8, size)
             var batch = [(label: Int, image: CharacterImage)]()
-            batch.reserveCapacity(entry.drawable.count * (1 + augment))
+            batch.reserveCapacity(entry.drawable.count * (1 + maxAugment))
 
             for item in entry.drawable {
                 if item.index < 0 || item.index >= vocabCount {
+                    continue
+                }
+                // この桝を使わない区分の文字は飛ばす (--kanji-sizes で漢字だけ別サイズにする)
+                if !options.sizes(for: item.category).contains(size) {
                     continue
                 }
                 guard let glyph = FontLoader.glyph(font, item.scalar) else {
@@ -1318,10 +1559,13 @@ func run() {
                     continue
                 }
                 stats.drawn += 1
+
                 batch.append((label: item.index, image: base))
+                let aug = item.category == .kanjiLevel1 ? kanjiAugmenter : augmenter
+                let augment = augmentCount(item.category)
                 var a = 0
                 while a < augment {
-                    batch.append((label: item.index, image: augmenter.augment(base)))
+                    batch.append((label: item.index, image: aug.augment(base)))
                     a += 1
                 }
             }
@@ -1347,15 +1591,8 @@ func run() {
     }
 
     // --- 並列実行 (フォント単位。--workers で束ねる数を決める) ---
-    // 手書き調の書体は拡張枚数を --oversample 倍にする (train 側のみ。
-    // eval は held-out フォントの素の分布を測るので倍率を掛けない)
-    @Sendable func augmentCount(for entry: FontEntry, oversampled: Bool) -> Int {
-        if oversampled && oversampleNames.contains(entry.postScriptName) {
-            return options.augment * options.oversample
-        }
-        return options.augment
-    }
-
+    // oversampled = true の側 (train) だけ手書き調の書体の拡張枚数を --oversample 倍にする。
+    // eval は held-out フォントの素の分布を測るので倍率を掛けない (実際の枚数は process 内で決める)
     func runGroup(_ list: [FontEntry], offset: Int, oversampled: Bool, sink: SampleSink) {
         if list.isEmpty {
             return
@@ -1364,7 +1601,7 @@ func run() {
         if width == 1 {
             for (i, e) in list.enumerated() {
                 process(entry: e, fontIndex: offset + i,
-                        augment: augmentCount(for: e, oversampled: oversampled), sink: sink)
+                        oversampled: oversampled, sink: sink)
             }
             return
         }
@@ -1373,7 +1610,7 @@ func run() {
             while i < list.count {
                 let e = list[i]
                 process(entry: e, fontIndex: offset + i,
-                        augment: augmentCount(for: e, oversampled: oversampled), sink: sink)
+                        oversampled: oversampled, sink: sink)
                 i += width
             }
         }

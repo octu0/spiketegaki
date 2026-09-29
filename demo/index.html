@@ -78,6 +78,18 @@
   #penRow label { font-size: 0.85rem; color: var(--sub); white-space: nowrap; }
   #pen { flex: 1 1 100px; min-width: 90px; }
   #penValue { font-variant-numeric: tabular-nums; font-size: 0.8rem; color: var(--sub); white-space: nowrap; }
+  /* 認識モード (区分でロジットをマスクするだけ) と重み (語彙は共通なので .stgw を読み直すだけ)。
+     どちらも選び直すと直前の筆記をその場で引き直す */
+  #modeRow label, #weightsRow label { font-size: 0.85rem; color: var(--sub); white-space: nowrap; }
+  #mode, #weights {
+    font: inherit;
+    font-size: 0.85rem;
+    padding: 4px 8px;
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    background: #fff;
+    color: var(--ink);
+  }
   #strokeWidth { margin: 10px 0 0; font-size: 0.85rem; font-variant-numeric: tabular-nums; }
   .note { margin: 4px 0 0; font-size: 0.75rem; color: var(--sub); line-height: 1.5; }
 
@@ -104,7 +116,7 @@
   <h1>spiketegaki — SNN 手書き 1 文字認識 (wasm)</h1>
   <p class="lead">
     <strong>枠の中に 1 文字書いてください (大きさ・位置は問いません)。</strong>ペンを離すと墨の外接矩形を切り出し、
-    学習データと同じ占有率 (長辺の 85%) に揃えてから認識します。ペンを離して 150 ms 後に自動で認識します。筆の太さは枠の下のスライダーで変えられます (次の筆記から反映)。
+    学習データと同じ占有率 (長辺の 85%) に揃えてから認識します。ペンを離して 150 ms 後に自動で認識します。筆の太さは枠の下のスライダーで変えられます (次の筆記から反映)。認識モードを選ぶと候補をその区分 (ひらがな・カタカナ・英数・漢字) に絞り、直前の筆記をその場で引き直します。重みは「かな」(既定) と「漢字 80 字」を選べます (切り替えると読み直してその場で引き直します。漢字 80 字の重みは小学 1 年の 80 字だけで学習したものなので、漢字モードと合わせて使います)。
     推論は SwiftWasm でビルドした純 Swift の SNN が、このページの中で走ります。
   </p>
 
@@ -120,6 +132,14 @@
         <label for="pen">筆幅</label>
         <input id="pen" type="range" min="6" max="24" step="1" value="10">
         <span id="penValue">10 px</span>
+      </div>
+      <div class="row" id="modeRow">
+        <label for="mode">認識モード</label>
+        <select id="mode"></select>
+      </div>
+      <div class="row" id="weightsRow">
+        <label for="weights">重み</label>
+        <select id="weights"></select>
       </div>
     </div>
 

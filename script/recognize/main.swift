@@ -35,7 +35,53 @@ struct Options {
     var dumpCount = 20
     var dumpScale = 8
     var exportWeightsPath: String?
+    var scripts: Set<ScriptCategory> = []   // 空 = 全区分 (マスクしない)
     var pngPaths: [String] = []
+
+    /// --scripts の綴りは render と同じ。latin は大小両方、kana は平仮名 + 片仮名。
+    static let scriptAliases: [String: ScriptCategory] = [
+        "digits": .digits,
+        "ascii": .asciiSymbols,
+        "asciisymbols": .asciiSymbols,
+        "latin": .latinUpper,          // latin は大小両方を指す (下で展開する)
+        "latinupper": .latinUpper,
+        "latinlower": .latinLower,
+        "hiragana": .hiragana,
+        "kana": .hiragana,             // kana は平仮名 + 片仮名 (下で展開する)
+        "katakana": .katakana,
+        "kanji": .kanjiLevel1,
+        "kanjilevel1": .kanjiLevel1
+    ]
+
+    /// カンマ区切りの区分名を集合にする。all は空集合 (= マスクしない) で返す。
+    static func parseScripts(_ s: String) -> Set<ScriptCategory> {
+        var set = Set<ScriptCategory>()
+        let parts = s.split(separator: ",")
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty }
+        if parts.isEmpty {
+            fail("--scripts が空です")
+        }
+        for raw in parts {
+            let key = raw.lowercased()
+            if key == "all" {
+                return []
+            }
+            guard let c = scriptAliases[key] else {
+                fail("--scripts の値が不明です: \(raw)  (digits,ascii,latin,hiragana,katakana,kanji,all)")
+            }
+            switch key {
+            case "latin": set.formUnion([.latinUpper, .latinLower])
+            case "kana":  set.formUnion([.hiragana, .katakana])
+            default:      set.insert(c)
+            }
+        }
+        // 全区分を並べたのは all と同じなので、空集合に畳む
+        if set.count == ScriptCategory.allCases.count {
+            return []
+        }
+        return set
+    }
 
     static func parse(_ args: [String]) -> Options {
         var o = Options()
@@ -74,6 +120,7 @@ struct Options {
             case "--dump-count":     o.dumpCount = int(a, min: 1)
             case "--dump-scale":     o.dumpScale = int(a, min: 1)
             case "--export-weights": o.exportWeightsPath = next(a)
+            case "--scripts":        o.scripts = Options.parseScripts(next(a))
             case "--help", "-h":     printUsage(); exit(0)
             default:
                 if a.hasPrefix("--") {
@@ -113,6 +160,10 @@ func printUsage() {
       --dump-count <n>        書き出す枚数 (既定 20)
       --dump-scale <n>        書き出し時の拡大率 (既定 8 -> 256x256)
       --export-weights <stgw> 重みをバイナリ形式 (STGW v1) に書き出して終了する
+      --scripts <a,b>         認識する区分を絞る (digits,ascii,latin,hiragana,katakana,kanji,all。
+                              既定 all)。指定区分の外のロジットを除いて softmax を取るので、
+                              候補も確率もその区分の中だけになる。
+                              --dataset では正解が区分の外のサンプルを採点から外す。
     """)
 }
 
@@ -315,6 +366,18 @@ func writePNG(_ image: CharacterImage, to url: URL, scale: Int) throws {
     }
 }
 
+// MARK: - 区分の表示
+
+/// --scripts の内容を人が読む形にする。空集合は all。
+func scriptsDescription(_ scripts: Set<ScriptCategory>) -> String {
+    if scripts.isEmpty {
+        return "all"
+    }
+    return ScriptCategory.allCases.filter { scripts.contains($0) }
+        .map { $0.rawValue }
+        .joined(separator: ",")
+}
+
 // MARK: - PNG モード
 
 func runPNGMode(_ o: Options, classifier: CharacterClassifier) -> Int32 {
@@ -331,8 +394,8 @@ func runPNGMode(_ o: Options, classifier: CharacterClassifier) -> Int32 {
             if image.inkSum <= 0.0 {
                 throw PNGError.noInk(path)
             }
-            let top = try classifier.classify(image: image, topK: o.topK)
-            print("\(path)  (\(w)x\(h), 墨 \(String(format: "%.1f", image.inkSum)) 画素相当)")
+            let top = try classifier.classify(image: image, topK: o.topK, categories: o.scripts)
+            print("\(path)  (\(w)x\(h), 墨 \(String(format: "%.1f", image.inkSum)) 画素相当, 区分 \(scriptsDescription(o.scripts)))")
             for (rank, e) in top.enumerated() {
                 print(String(
                     format: "  %d. %@  index %4d  %.4f",
@@ -371,6 +434,8 @@ func runDatasetMode(_ o: Options, classifier: CharacterClassifier, path: String)
     let vocab = classifier.vocabulary
     var top1 = 0
     var top5 = 0
+    var evaluated = 0   // --scripts で残ったサンプル数 (正解率の分母)
+    var skipped = 0     // 正解が指定区分の外だったサンプル数
     var perCategoryTotal = [ScriptCategory: Int]()
     var perCategoryTop1 = [ScriptCategory: Int]()
     var perCategoryTop5 = [ScriptCategory: Int]()
@@ -412,10 +477,18 @@ func runDatasetMode(_ o: Options, classifier: CharacterClassifier, path: String)
             fail("サンプル \(i) のラベル \(sample.label) が語彙 \(vocab.count) の範囲外です")
         }
         let category = vocab.category(of: sample.label)
+        // 正解が指定区分の外のサンプルは採点しない (マスクすると絶対に当たらないため)。
+        // 書き出し (--dump-samples) の対象からも外れる
+        if !o.scripts.isEmpty && !o.scripts.contains(category) {
+            skipped += 1
+            i += 1
+            continue
+        }
+        evaluated += 1
         perCategoryTotal[category, default: 0] += 1
 
         do {
-            let top = try classifier.classify(image: sample.image, topK: 5)
+            let top = try classifier.classify(image: sample.image, topK: 5, categories: o.scripts)
             if top.first?.index == sample.label {
                 top1 += 1
                 perCategoryTop1[category, default: 0] += 1
@@ -458,11 +531,24 @@ func runDatasetMode(_ o: Options, classifier: CharacterClassifier, path: String)
     let elapsed = Date().timeIntervalSince(started)
 
     print("データセット: \(path)")
-    print("  評価件数    : \(total) / \(reader.count)")
-    print(String(format: "  top-1 正解率: %.4f  (%d / %d)", Double(top1) / Double(total), top1, total))
-    print(String(format: "  top-5 正解率: %.4f  (%d / %d)", Double(top5) / Double(total), top5, total))
-    print(String(format: "  チャンスレベル: %.5f (1/%d)", 1.0 / Double(vocab.count), vocab.count))
-    print(String(format: "  所要時間    : %.2f 秒 (%.2f ms/件)", elapsed, elapsed * 1000.0 / Double(total)))
+    print("  区分        : \(scriptsDescription(o.scripts))")
+    if evaluated == 0 {
+        print("  評価件数    : 0 / \(reader.count)  (走査 \(total) 件はすべて区分の外で除外)")
+        return 0
+    }
+    if skipped > 0 {
+        print("  評価件数    : \(evaluated) / \(reader.count)  (走査 \(total) 件のうち \(skipped) 件は正解が区分の外で除外)")
+    } else {
+        print("  評価件数    : \(evaluated) / \(reader.count)")
+    }
+    // チャンスレベルは指定区分の候補数の逆数 (マスク後は区分の中からしか出ない)
+    let candidates = o.scripts.isEmpty
+        ? vocab.count
+        : ScriptCategory.allCases.filter { o.scripts.contains($0) }.reduce(0) { $0 + vocab.range(of: $1).count }
+    print(String(format: "  top-1 正解率: %.4f  (%d / %d)", Double(top1) / Double(evaluated), top1, evaluated))
+    print(String(format: "  top-5 正解率: %.4f  (%d / %d)", Double(top5) / Double(evaluated), top5, evaluated))
+    print(String(format: "  チャンスレベル: %.5f (1/%d)", 1.0 / Double(candidates), candidates))
+    print(String(format: "  所要時間    : %.2f 秒 (%.2f ms/件)", elapsed, elapsed * 1000.0 / Double(evaluated)))
     print("  -- 区分ごと --")
     for c in ScriptCategory.allCases {
         guard let n = perCategoryTotal[c], n > 0 else {
