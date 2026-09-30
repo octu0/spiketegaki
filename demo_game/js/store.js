@@ -1,7 +1,8 @@
-// localStorage への保存。最高記録と設定 (音・音量・筆幅) だけを持つ。
+// localStorage への保存。最高記録と設定 (音・音量・筆幅) と、つづきから用の途中の状態を持つ。
 // プライベートウィンドウなどで使えないことがあるので、読み書きは必ず try/catch。
 
 const KEY = 'spiketegaki.game';
+const PROGRESS_KEY = 'spiketegaki.game.progress';
 
 export const PEN_MIN = 6;
 export const PEN_MAX = 24;
@@ -15,6 +16,7 @@ const DEFAULTS = {
   bestScore: 0,
   bestDopa: null,   // 常用対数 L。null = まだ一度も遊んでいない (10^0 = 1 を最高記録に出さないため)
   bestCombo: 0,
+  bestStage: 0,     // 到達した最高のステージ (0 = まだ遊んでいない)
   sound: true,
   volume: VOLUME_DEFAULT,
   penWidth: PEN_DEFAULT
@@ -55,6 +57,7 @@ export function load() {
     bestScore: num(parsed.bestScore, DEFAULTS.bestScore),
     bestDopa: num(parsed.bestDopa, DEFAULTS.bestDopa),
     bestCombo: num(parsed.bestCombo, DEFAULTS.bestCombo),
+    bestStage: num(parsed.bestStage, DEFAULTS.bestStage),
     sound: typeof parsed.sound === 'boolean' ? parsed.sound : DEFAULTS.sound,
     volume: clampVolume(num(parsed.volume, DEFAULTS.volume)),
     penWidth: clampPen(num(parsed.penWidth, DEFAULTS.penWidth))
@@ -85,8 +88,42 @@ export function recordBest(state, summary) {
     state.bestCombo = summary.maxCombo;
     updated.push('combo');
   }
+  if (summary.stage > (state.bestStage ?? 0)) {
+    state.bestStage = summary.stage;
+    updated.push('stage');
+  }
   if (updated.length > 0) {
     save(state);
   }
   return updated;
+}
+
+// MARK: - つづきから
+
+/** 保存してある途中の状態 (Game#snapshot() の形)。無い・読めないときは null。中身の検査は game.js の parseProgress */
+export function loadProgress() {
+  try {
+    const raw = window.localStorage.getItem(PROGRESS_KEY);
+    return raw === null ? null : JSON.parse(raw);
+  } catch (error) {
+    return null;
+  }
+}
+
+/** 途中の状態を保存する。書けなくても遊べるので失敗は無視する */
+export function saveProgress(snapshot) {
+  try {
+    window.localStorage.setItem(PROGRESS_KEY, JSON.stringify(snapshot));
+  } catch (error) {
+    // 保存できなくてもゲームには影響しない
+  }
+}
+
+/** 途中の状態を消す (さいしょから) */
+export function clearProgress() {
+  try {
+    window.localStorage.removeItem(PROGRESS_KEY);
+  } catch (error) {
+    // 消せなくてもゲームには影響しない
+  }
 }

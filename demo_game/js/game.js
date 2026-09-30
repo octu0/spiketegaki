@@ -1,10 +1,10 @@
-// ラウンドの進行・判定・タイマー。DOM も canvas も触らないので node でそのまま試せる。
+// ステージの進行・判定・制限時間・ライフ。DOM も canvas も触らないので node でそのまま試せる。
 
-import { makeRound, pickExtra, PROBLEMS } from './problems.js';
+import { LAP_AVOID, pickProblem, problemOf, PROBLEMS } from './problems.js';
 import {
-  BASE_QUESTIONS,
-  COMBO_LIMIT_MS,
+  STAGE_QUESTIONS,
   COMBO_REPORT_MIN,
+  DOPA_MAX,
   advanceDopa,
   baseIncrement,
   baseIntensity,
@@ -13,7 +13,6 @@ import {
   extraIncrement,
   extraIntensity,
   extraQuestionScore,
-  extraTier,
   isComboCelebration,
   score
 } from './scoring.js';
@@ -22,18 +21,31 @@ import {
 export const CORRECT = 'correct';   // top-1 が対象字
 export const CLOSE = 'close';       // top-3 に対象字 (おしい)
 export const WRONG = 'wrong';       // それ以外 (もういちど)
+export const TIMEOUT = 'timeout';   // 0 秒になっても正解が書けていない (時間切れ)
 
 /** 同じ問題でこの回数だけ外したら、なぞり用の薄い見本を出す */
 export const HINT_AFTER_MISSES = 2;
-/** エクストラの制限時間 (ms) */
-export const EXTRA_MS = 90000;
+/** 1 問の制限時間 (ms) */
+export const TIME_LIMIT_MS = 15000;
+/** 問題が出てから数え始めるまで (ms)。次の問題がすべり込む間は数えない */
+export const TIME_GRACE_MS = 200;
+/** 残り何秒から中央に数字を出すか */
+export const COUNTDOWN_FROM = 5;
+/** 残り時間のバーを赤く脈動させる割合 */
+export const TIME_LOW = 0.3;
+/** 時間切れのとき、正解の字を見せる長さ (ms) */
+export const REVEAL_MS = 800;
+/** ライフ (ミス 3 回でゲームオーバー) */
+export const LIVES = 3;
+/** 1 ステージで使えるパスの回数 */
+export const PASS_LIMIT = 3;
 /** 認識器から取る候補数。「おしい」の判定に top-3 まで見る */
 export const TOP_K = 3;
 
 /** 局面 */
-const PHASE_BASE = 'base';
-export const PHASE_EXTRA = 'extra';
-export const PHASE_DONE = 'done';
+export const PHASE_PLAY = 'play';       // 書ける (制限時間が進む)
+export const PHASE_REVEAL = 'reveal';   // 時間切れで正解の字を見せている (時間は止まる)
+export const PHASE_OVER = 'over';       // ライフ 0 (ゲームオーバー)
 
 /**
  * 認識結果 (top-k) と対象字から判定する。
@@ -118,28 +130,143 @@ export function judgeDelay({ penDown = false, autoTried = false } = {}, elapsed)
   return 0;
 }
 
+// MARK: - 制限時間
+
+/**
+ * 中央に出すカウントダウンの数字。残り 5 秒から 5, 4, 3, 2, 1 (各 1 秒)、それ以外は null。
+ * 残り 4001〜5000 ms が 5、1〜1000 ms が 1。0 は時間切れなので出さない。
+ *
+ * @param {number} remainingMs 残り時間 (ms)
+ */
+export function countdownNumber(remainingMs) {
+  if (!(remainingMs > 0) || remainingMs > COUNTDOWN_FROM * 1000) {
+    return null;
+  }
+  return Math.ceil(remainingMs / 1000);
+}
+
+/** 残り時間のバーの長さ (0〜1)。時間が止まっている (Infinity) ときは満タン */
+export function timeRatio(remainingMs) {
+  if (remainingMs === Infinity) {
+    return 1;
+  }
+  if (!Number.isFinite(remainingMs)) {
+    return 0;
+  }
+  return Math.min(1, Math.max(0, remainingMs / TIME_LIMIT_MS));
+}
+
+/**
+ * 0 秒の瞬間の判定。墨があれば認識した結果 (rows) を渡し、墨が無い・薄墨で認識しなかったときは null。
+ * top-1 が対象字なら正解 (ぎりぎりセーフ)、それ以外 (おしい を含む) は時間切れ。
+ *
+ * @param {{char: string}[]|null} rows 確率の高い順の候補
+ * @param {string} target 対象字
+ */
+export function timeUpVerdict(rows, target) {
+  return rows && judge(rows, target) === CORRECT ? CORRECT : TIMEOUT;
+}
+
+// MARK: - つづきから
+
+const isCount = (v, max = Infinity) => Number.isInteger(v) && v >= 0 && v <= max;
+
+/** 字の配列 (出題データにある字だけ) か。そうでなければ null */
+function kanjiList(value, max = Infinity) {
+  if (!Array.isArray(value) || value.length > max) {
+    return null;
+  }
+  return value.every((k) => typeof k === 'string' && problemOf(k) !== null) ? value.slice() : null;
+}
+
+/**
+ * 保存しておいた途中の状態を読み、そのまま使える形にする。壊れていれば null。
+ * 出題順 (このステージで出した問題、末尾が今の問題)・あつめた字・正解済み・復習・最近出した字は字で持つ
+ * (出題データに無い字が混ざっていたら壊れているとみなす)。
+ *
+ * @param {object|null} saved Game#snapshot() を保存したもの
+ * @param {number} questionCount 1 ステージの問題数
+ */
+export function parseProgress(saved, questionCount = STAGE_QUESTIONS) {
+  if (saved === null || typeof saved !== 'object') {
+    return null;
+  }
+  const order = kanjiList(saved.order, questionCount);
+  const collected = kanjiList(saved.collected);
+  const solved = kanjiList(saved.solved);
+  const review = kanjiList(saved.review);
+  const recent = kanjiList(saved.recent, LAP_AVOID);
+  if ([order, collected, solved, review, recent].includes(null)) {
+    return null;
+  }
+  const ok = Number.isInteger(saved.stage) && saved.stage >= 1
+    && isCount(saved.index, questionCount - 1)
+    && order.length === saved.index + 1
+    && isCount(saved.lap) && saved.lap >= 1
+    && Number.isInteger(saved.lives) && saved.lives >= 1 && saved.lives <= LIVES
+    && isCount(saved.passes, PASS_LIMIT)
+    && isCount(saved.firstStageSolved, questionCount)
+    && isCount(saved.laterSolved)
+    && isCount(saved.stageCorrect, questionCount)
+    && Number.isFinite(saved.dopa) && saved.dopa >= 0 && saved.dopa <= DOPA_MAX;
+  if (!ok) {
+    return null;
+  }
+  const count = (v) => (isCount(v) ? v : 0);
+  return {
+    stage: saved.stage,
+    index: saved.index,
+    order: order.map((k) => problemOf(k)),
+    solved,
+    review,
+    recent,
+    lap: saved.lap,
+    lives: saved.lives,
+    passes: saved.passes,
+    firstStageSolved: saved.firstStageSolved,
+    laterSolved: saved.laterSolved,
+    stageCorrect: saved.stageCorrect,
+    dopa: saved.dopa,
+    collected,
+    maxCombo: count(saved.maxCombo),
+    correctCount: count(saved.correctCount),
+    closeCount: count(saved.closeCount),
+    firstTryCount: count(saved.firstTryCount)
+  };
+}
+
 export class Game {
   /**
    * @param {object} options
    * @param {() => number} options.random [0, 1) の乱数
    * @param {() => number} options.now 現在時刻 (ms)
-   * @param {number} options.questionCount 基本ラウンドの問題数
+   * @param {number} options.questionCount 1 ステージの問題数
+   * @param {object|null} options.saved つづきから (parseProgress に通したもの)。null なら最初から
    */
-  constructor({ random = Math.random, now = () => Date.now(), questionCount = BASE_QUESTIONS } = {}) {
+  constructor({ random = Math.random, now = () => Date.now(), questionCount = STAGE_QUESTIONS, saved = null } = {}) {
     this.random = random;
     this.now = now;
     this.questionCount = Math.min(questionCount, PROBLEMS.length);
     this.reset();
+    if (saved !== null) {
+      this.resume(saved);
+    }
   }
 
   reset() {
-    this.phase = PHASE_BASE;
-    this.round = makeRound(this.questionCount, this.random);
-    this.index = 0;              // 基本の現在位置 (0 始まり)
-    this.baseSolved = 0;
-    this.extraSolved = 0;
-    this.extraProblem = null;
-    this.recent = [];            // エクストラで直前に出した問題
+    this.phase = PHASE_PLAY;
+    this.stage = 1;              // 1 始まり
+    this.round = [];             // このステージで出した問題 (末尾が今の問題)
+    this.index = 0;              // ステージ内の位置 (0 始まり)
+    this.solved = new Set();     // このゲームで正解した字 (再出題しない。全部正解したら空にして次の周へ)
+    this.review = [];            // ミス・パスで終わってまだ正解していない字 (復習として優先して出す)
+    this.recent = [];            // 最近出した字 (古い順、LAP_AVOID 問まで)
+    this.lap = 1;                // 何周目か
+    this.firstStageSolved = 0;   // ステージ 1 で正解した数
+    this.laterSolved = 0;        // ステージ 2 以降で正解した数 (得点・ドパ・強度の k)
+    this.stageCorrect = 0;       // 今のステージで正解した数 (0 ならクリアを祝わない)
+    this.lives = LIVES;
+    this.passes = 0;             // 今のステージで使ったパス
     this.misses = 0;             // 今の問題で外した回数
     this.combo = 0;
     this.maxCombo = 0;
@@ -147,39 +274,89 @@ export class Game {
     this.correctCount = 0;
     this.closeCount = 0;
     this.firstTryCount = 0;
-    this.comboDeadline = Infinity;
-    this.extraDeadline = Infinity;
+    this.collected = [];         // 正解した字 (ステージをまたいで並ぶ)
     this.startedAt = this.now();
+    this.present(this.pick());
     this.startTimer();
   }
 
-  /** 今の問題 (基本 / エクストラ)。終わっていれば null */
+  /** つづきから: 保存した位置・得点・ドパ・あつめた字・ライフに戻す (コンボは 0) */
+  resume(saved) {
+    this.stage = saved.stage;
+    this.round = saved.order.slice();
+    this.index = saved.index;
+    this.solved = new Set(saved.solved);
+    this.review = saved.review.slice();
+    this.recent = saved.recent.slice();
+    this.lap = saved.lap;
+    this.lives = saved.lives;
+    this.passes = saved.passes;
+    this.firstStageSolved = saved.firstStageSolved;
+    this.laterSolved = saved.laterSolved;
+    this.stageCorrect = saved.stageCorrect;
+    this.dopa = saved.dopa;
+    this.collected = saved.collected.slice();
+    this.maxCombo = saved.maxCombo;
+    this.correctCount = saved.correctCount;
+    this.closeCount = saved.closeCount;
+    this.firstTryCount = saved.firstTryCount;
+    this.startTimer();
+  }
+
+  /**
+   * 保存する状態。ゲームオーバーではリトライと同じ位置 (失敗した問題、ライフ満タン) を残す。
+   * 出題順・あつめた字・正解済み・復習・最近出した字は字だけを持つ。
+   */
+  snapshot() {
+    return {
+      stage: this.stage,
+      index: this.index,
+      order: this.round.map((p) => p.kanji),
+      solved: [...this.solved],
+      review: this.review.slice(),
+      recent: this.recent.slice(),
+      lap: this.lap,
+      lives: this.phase === PHASE_OVER ? LIVES : this.lives,
+      passes: this.passes,
+      firstStageSolved: this.firstStageSolved,
+      laterSolved: this.laterSolved,
+      stageCorrect: this.stageCorrect,
+      dopa: this.dopa,
+      score: this.score(),
+      collected: this.collected.slice(),
+      maxCombo: this.maxCombo,
+      correctCount: this.correctCount,
+      closeCount: this.closeCount,
+      firstTryCount: this.firstTryCount
+    };
+  }
+
+  /** 今の問題。ゲームオーバーでは失敗した問題、時間切れの表示中はその問題 */
   current() {
-    if (this.phase === PHASE_BASE) {
-      return this.round[this.index] ?? null;
-    }
-    if (this.phase === PHASE_EXTRA) {
-      return this.extraProblem;
-    }
-    return null;
+    return this.round[this.index] ?? null;
+  }
+
+  /** 書いて判定を受け付けるか */
+  playing() {
+    return this.phase === PHASE_PLAY;
   }
 
   /** 今の得点 */
   score() {
-    return score(this.baseSolved, this.extraSolved);
+    return score(this.firstStageSolved, this.laterSolved);
   }
 
   /** 今の演出強度 E */
   intensity() {
-    if (this.phase === PHASE_EXTRA) {
-      return extraIntensity(this.extraSolved);
+    if (this.stage > 1) {
+      return extraIntensity(this.laterSolved);
     }
     return baseIntensity(Math.min(this.index, this.questionCount - 1), this.questionCount);
   }
 
-  /** エクストラの段 (基本では 0) */
-  tier() {
-    return this.phase === PHASE_EXTRA ? extraTier(this.extraSolved) : 0;
+  /** このステージで残っているパスの回数 */
+  passesLeft() {
+    return PASS_LIMIT - this.passes;
   }
 
   /** なぞり用の薄い見本を出すか */
@@ -187,87 +364,130 @@ export class Game {
     return this.misses >= HINT_AFTER_MISSES;
   }
 
-  /** コンボの残り時間 (ms)。1 コンボ以下は時間切れの対象外なので Infinity */
-  comboRemainingMs() {
-    if (this.combo <= 1) {
+  /** 今の問題の残り時間 (ms)。数え始めるまでは満タン、止まっているときは Infinity */
+  remainingMs() {
+    if (this.deadline === Infinity) {
       return Infinity;
     }
-    return Math.max(0, this.comboDeadline - this.now());
+    return Math.max(0, Math.min(TIME_LIMIT_MS, this.deadline - this.now()));
   }
 
-  /** エクストラの残り時間 (ms)。基本では Infinity */
-  extraRemainingMs() {
-    return this.extraDeadline === Infinity ? Infinity : Math.max(0, this.extraDeadline - this.now());
+  /** 今の問題の制限時間を引き直す (次の問題が書けるようになった時点から数える) */
+  startTimer() {
+    this.deadline = this.now() + TIME_GRACE_MS + TIME_LIMIT_MS;
   }
 
   /**
-   * 時間の経過を反映する。画面側から毎フレーム呼ぶ。
-   * @returns {{comboExpired: boolean, brokenCombo: number, extraExpired: boolean}}
+   * 時間の経過を見る。画面側から毎フレーム呼ぶ。
+   * timeUp が true なら、画面側は筆記領域の墨を認識して timeUp(rows) を呼ぶ。
+   * @returns {{timeUp: boolean}}
    */
   tick() {
-    let comboExpired = false;
-    let brokenCombo = 0;
-    if (this.combo > 1 && this.now() >= this.comboDeadline) {
-      brokenCombo = this.combo;
-      this.combo = 0;
-      this.comboDeadline = Infinity;
-      comboExpired = true;
-    }
-    let extraExpired = false;
-    if (this.phase === PHASE_EXTRA && this.now() >= this.extraDeadline) {
-      this.phase = PHASE_DONE;
-      extraExpired = true;
-    }
-    return { comboExpired, brokenCombo, extraExpired };
+    return { timeUp: this.phase === PHASE_PLAY && this.now() >= this.deadline };
   }
 
   /**
-   * 認識結果を 1 回ぶん反映する。
+   * 認識結果を 1 回ぶん反映する (誤答の宣言か、正解の確定)。
    *
    * @param {{char: string}[]} rows 確率の高い順の候補
    * @returns {object} 判定と、そこで起きたこと
    */
   answer(rows) {
-    // 判定は画面の毎フレームの tick() より先に来ることがあるので、まず期限を反映する。
-    // 期限切れのコンボは 0 に戻してから数え、エクストラが終わっていれば受け付けない。
-    const expired = this.tick();
+    if (this.phase !== PHASE_PLAY) {
+      return { verdict: WRONG, ignored: true };
+    }
+    // 判定は画面の毎フレームの tick() より先に来ることがある。0 秒を過ぎて届いた判定は 0 秒の判定として扱う
+    if (this.now() >= this.deadline) {
+      return this.timeUp(rows);
+    }
     const problem = this.current();
-    if (problem === null) {
-      return { verdict: WRONG, ignored: true, extraExpired: expired.extraExpired };
-    }
     const verdict = judge(rows, problem.kanji);
-    if (verdict !== CORRECT) {
-      const brokenCombo = this.combo;
-      this.misses += 1;
-      this.combo = 0;
-      this.comboDeadline = Infinity;
-      if (verdict === CLOSE) {
-        this.closeCount += 1;
-      }
-      return {
-        verdict,
-        problem,
-        misses: this.misses,
-        showsHint: this.showsHint(),
-        brokenCombo: brokenCombo >= COMBO_REPORT_MIN ? brokenCombo : 0
-      };
+    if (verdict === CORRECT) {
+      return this.solve(problem, false);
     }
+    this.misses += 1;
+    if (verdict === CLOSE) {
+      this.closeCount += 1;
+    }
+    return {
+      verdict,
+      problem,
+      misses: this.misses,
+      showsHint: this.showsHint(),
+      ...this.loseLife()
+    };
+  }
 
-    // 正解。先にコンボを 1 増やしてから、その倍率でドパを足す (SPEC §5.2)
+  /**
+   * 0 秒の判定。墨があれば認識結果 (rows)、無ければ null を渡す。
+   * 正解ならぎりぎりセーフ (safe: true)、それ以外は時間切れでミス 1。
+   * 時間切れでライフが残っていれば、正解の字を見せる局面 (PHASE_REVEAL) に入る。画面側は
+   * REVEAL_MS のあと finishReveal() で次の問題へ進める。
+   *
+   * @param {{char: string}[]|null} rows 確率の高い順の候補
+   */
+  timeUp(rows) {
+    if (this.phase !== PHASE_PLAY) {
+      return { verdict: TIMEOUT, ignored: true };
+    }
+    const problem = this.current();
+    if (timeUpVerdict(rows, problem.kanji) === CORRECT) {
+      return this.solve(problem, true);
+    }
+    this.deadline = Infinity;
+    this.remember(problem);
+    const lost = this.loseLife();
+    if (!lost.gameOver) {
+      this.phase = PHASE_REVEAL;
+    }
+    return { verdict: TIMEOUT, problem, ...lost };
+  }
+
+  /** 時間切れの字を見せ終えた。次の問題へ (ステージの最終問ならステージクリア) */
+  finishReveal() {
+    if (this.phase !== PHASE_REVEAL) {
+      return null;
+    }
+    this.phase = PHASE_PLAY;
+    return this.advance();
+  }
+
+  /** ミス 1: コンボを切り、ライフを 1 減らす。0 になればゲームオーバー (時間は止まる) */
+  loseLife() {
+    const brokenCombo = this.combo;
+    this.combo = 0;
+    this.lives = Math.max(0, this.lives - 1);
+    const gameOver = this.lives === 0;
+    if (gameOver) {
+      this.phase = PHASE_OVER;
+      this.deadline = Infinity;
+    }
+    return {
+      lives: this.lives,
+      gameOver,
+      brokenCombo: brokenCombo >= COMBO_REPORT_MIN ? brokenCombo : 0
+    };
+  }
+
+  /** 正解。先にコンボを 1 増やしてから、その倍率でドパを足す (SPEC §5.2) */
+  solve(problem, safe) {
     this.combo += 1;
     this.maxCombo = Math.max(this.maxCombo, this.combo);
     this.correctCount += 1;
+    this.stageCorrect += 1;
     if (this.misses === 0) {
       this.firstTryCount += 1;
     }
-    const increment = this.phase === PHASE_EXTRA
-      ? extraIncrement(this.extraSolved)
+    const later = this.stage > 1;
+    const increment = later
+      ? extraIncrement(this.laterSolved)
       : baseIncrement(this.index, this.questionCount);
     const before = this.dopa;
     this.dopa = advanceDopa(before, increment, this.combo);
 
     const result = {
       verdict: CORRECT,
+      safe,
       problem,
       combo: this.combo,
       comboCelebration: isComboCelebration(this.combo),
@@ -276,79 +496,103 @@ export class Game {
       dopaAfter: this.dopa,
       milestones: crossedMilestones(before, this.dopa),
       intensity: this.intensity(),
-      gained: 0,
-      baseFinished: false
+      gained: later ? extraQuestionScore(this.laterSolved) : 10
     };
-
-    if (this.phase === PHASE_EXTRA) {
-      result.gained = extraQuestionScore(this.extraSolved);
-      this.extraSolved += 1;
-      this.nextExtra();
+    if (later) {
+      this.laterSolved += 1;
     } else {
-      result.gained = 10;
-      this.baseSolved += 1;
-      this.index += 1;
-      if (this.index >= this.round.length) {
-        result.baseFinished = true;
-        this.phase = PHASE_DONE;
-        this.comboDeadline = Infinity;
-      } else {
-        this.misses = 0;
-        this.startTimer();
-      }
+      this.firstStageSolved += 1;
     }
+    this.collected.push(problem.kanji);
+    this.solved.add(problem.kanji);
+    this.review = this.review.filter((k) => k !== problem.kanji);
+    Object.assign(result, this.advance());
     result.score = this.score();
     return result;
   }
 
-  /** パス。得点もドパも増やさず、コンボを 0 にして次の問題へ */
-  pass() {
-    if (this.phase === PHASE_DONE) {
-      return { passed: false };
-    }
-    const brokenCombo = this.combo;
-    this.combo = 0;
-    this.comboDeadline = Infinity;
+  /**
+   * 次の問題へ。ステージの最終問を終えたら次のステージへ進む (パスの回数はステージごと)。
+   * 次の 1 問は pickProblem で選ぶ (正解した字は出さない、復習の字は 3 問挟んでから)。
+   * @returns {{stageCleared: number, clearedCorrect: number}} クリアしたステージ (0 = まだ途中) とその正解数
+   */
+  advance() {
     this.misses = 0;
-    if (this.phase === PHASE_EXTRA) {
-      this.nextExtra();
-      return { passed: true, brokenCombo: brokenCombo >= COMBO_REPORT_MIN ? brokenCombo : 0 };
-    }
     this.index += 1;
-    if (this.index >= this.round.length) {
-      this.phase = PHASE_DONE;
-      return { passed: true, baseFinished: true, brokenCombo: brokenCombo >= COMBO_REPORT_MIN ? brokenCombo : 0 };
+    let stageCleared = 0;
+    let clearedCorrect = 0;
+    if (this.index >= this.questionCount) {
+      stageCleared = this.stage;
+      clearedCorrect = this.stageCorrect;
+      this.stage += 1;
+      this.round = [];
+      this.index = 0;
+      this.passes = 0;
+      this.stageCorrect = 0;
     }
+    this.present(this.pick());
     this.startTimer();
-    return { passed: true, brokenCombo: brokenCombo >= COMBO_REPORT_MIN ? brokenCombo : 0 };
+    return { stageCleared, clearedCorrect };
   }
 
-  /** 基本の完走後にエクストラへ進む。コンボは 0 に戻し、ドパは引き継ぐ (SPEC §5.2) */
-  startExtra() {
-    this.phase = PHASE_EXTRA;
-    this.combo = 0;
-    this.misses = 0;
-    this.extraDeadline = this.now() + EXTRA_MS;
-    this.nextExtra();
+  /** 次の 1 問を選ぶ。全部の字を正解していたら、正解済みを空にして次の周へ */
+  pick() {
+    if (PROBLEMS.every((p) => this.solved.has(p.kanji))) {
+      this.solved.clear();
+      this.lap += 1;
+    }
+    return pickProblem({ solved: this.solved, review: this.review, recent: this.recent }, this.random);
   }
 
-  /** エクストラの次の 1 問を選ぶ */
-  nextExtra() {
-    this.extraProblem = pickExtra(this.recent, this.random);
-    this.recent.push(this.extraProblem);
-    if (this.recent.length > 20) {
+  /** 問題を出す (このステージの出題順と、最近出した字に積む) */
+  present(problem) {
+    this.round.push(problem);
+    this.recent.push(problem.kanji);
+    if (this.recent.length > LAP_AVOID) {
       this.recent.shift();
     }
+  }
+
+  /** 正解できずに終わった字 (パス・時間切れ) を復習に回す */
+  remember(problem) {
+    if (!this.solved.has(problem.kanji) && !this.review.includes(problem.kanji)) {
+      this.review.push(problem.kanji);
+    }
+  }
+
+  /** パス。ライフは減らさず、得点もドパも増やさず、コンボを 0 にして次の問題へ。1 ステージ 3 回まで */
+  pass() {
+    if (this.phase !== PHASE_PLAY || this.passes >= PASS_LIMIT) {
+      return { passed: false };
+    }
+    this.passes += 1;
+    this.remember(this.current());
+    const brokenCombo = this.combo;
+    this.combo = 0;
+    return {
+      passed: true,
+      brokenCombo: brokenCombo >= COMBO_REPORT_MIN ? brokenCombo : 0,
+      ...this.advance()
+    };
+  }
+
+  /**
+   * リトライ: ライフを満タンに戻して、失敗した問題から続ける。
+   * 得点・ドパ・あつめた字・パスの回数はそのまま、コンボは 0、制限時間は引き直す。
+   */
+  retry() {
+    if (this.phase !== PHASE_OVER) {
+      return false;
+    }
+    this.phase = PHASE_PLAY;
+    this.lives = LIVES;
+    this.combo = 0;
     this.misses = 0;
     this.startTimer();
+    return true;
   }
 
-  /** 今の問題のコンボ制限時間を引き直す (入力を受け付ける時点で期限を決める) */
-  startTimer() {
-    this.comboDeadline = this.now() + COMBO_LIMIT_MS;
-  }
-
-  /** 結果画面に出す値 */
+  /** 終了画面に出す値 */
   summary() {
     return {
       score: this.score(),
@@ -357,7 +601,8 @@ export class Game {
       correctCount: this.correctCount,
       closeCount: this.closeCount,
       firstTryCount: this.firstTryCount,
-      extraSolved: this.extraSolved,
+      stage: this.stage,
+      collected: this.collected.slice(),
       elapsedMs: this.now() - this.startedAt
     };
   }

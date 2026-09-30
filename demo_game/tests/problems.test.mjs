@@ -2,7 +2,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { BLANK, PROBLEMS, blankedWord, makeRound, pickExtra } from '../js/problems.js';
+import { BLANK, LAP_AVOID, PROBLEMS, REPEAT_GAP, REVIEW_CHANCE, blankedWord, pickProblem, problemOf } from '../js/problems.js';
 
 // 小学 1 年の 80 字 (出題データと同じ集合・同じ並び)
 const GRADE1 = '一右雨円王音下火花貝学気九休玉金空月犬見五口校左三山子四糸字耳七車手十出女小上森人水正生青夕石赤千川先早草足村大男竹中虫町天田土二日入年白八百文木本名目立力林六';
@@ -62,51 +62,59 @@ test('空欄化は対象字の位置だけを □ にする', () => {
   }
 });
 
-test('ラウンドは 10 問・重複なし', () => {
+const ALL = PROBLEMS.map((p) => p.kanji);
+const none = { solved: new Set(), review: [], recent: [] };
+
+test('pickProblem: 正解済みの字は出さない', () => {
+  const solved = new Set(ALL.slice(0, 79));
   for (let trial = 0; trial < 50; trial += 1) {
-    const round = makeRound(10);
-    assert.equal(round.length, 10);
-    assert.equal(new Set(round.map((p) => p.kanji)).size, 10, '同じ字が 2 回出た');
-    for (const p of round) {
-      assert.ok(PROBLEMS.includes(p), `${p.kanji} が出題データに無い`);
+    assert.equal(pickProblem({ ...none, solved }).kanji, ALL[79]);
+  }
+  for (let trial = 0; trial < 200; trial += 1) {
+    const solvedHalf = new Set(ALL.slice(0, 40));
+    assert.ok(!solvedHalf.has(pickProblem({ ...none, solved: solvedHalf }).kanji));
+  }
+});
+
+test('pickProblem: 乱数が決まれば決まる (テストで固定できる)', () => {
+  assert.equal(pickProblem(none, () => 0).kanji, '一', '常に先頭を引く乱数なら先頭');
+  assert.equal(pickProblem(none, () => 0.999999).kanji, '六', '常に末尾を引く乱数なら末尾');
+});
+
+test(`pickProblem: 復習の字は ${REPEAT_GAP} 問挟むまで出さず、挟んだら REVIEW_CHANCE で優先する`, () => {
+  assert.equal(REPEAT_GAP, 3);
+  const review = ['山'];
+  // 直前 3 問に出ていると選べない
+  for (const recent of [['山'], ['山', '一'], ['山', '一', '右']]) {
+    for (let trial = 0; trial < 50; trial += 1) {
+      assert.notEqual(pickProblem({ ...none, review, recent }).kanji, '山', JSON.stringify(recent));
     }
   }
+  const recent = ['山', '一', '右', '雨'];
+  assert.equal(pickProblem({ ...none, review, recent }, () => 0).kanji, '山', '乱数 < REVIEW_CHANCE なら復習');
+  assert.notEqual(pickProblem({ ...none, review, recent }, () => REVIEW_CHANCE).kanji, '山', 'それ以外はまだ出していない字');
+  // まだ出していない字が無ければ必ず復習
+  const solved = new Set(ALL.filter((k) => k !== '山'));
+  assert.equal(pickProblem({ solved, review, recent }, () => 0.99).kanji, '山');
 });
 
-test('ラウンドは乱数が決まれば決まる (テストで固定できる)', () => {
-  const fixed = () => 0;
-  assert.deepEqual(
-    makeRound(5, fixed).map((p) => p.kanji),
-    ['一', '右', '雨', '円', '王'],
-    '常に先頭を引く乱数なら前から 5 字'
-  );
-  const last = () => 0.999999;
-  assert.deepEqual(
-    makeRound(3, last).map((p) => p.kanji),
-    ['六', '林', '力'],
-    '常に末尾を引く乱数なら後ろから 3 字'
-  );
-});
-
-test('ラウンドは 80 問までしか作れない (重複なしのため)', () => {
-  assert.equal(makeRound(200).length, 80);
-});
-
-test('エクストラは直前 10 問を避ける', () => {
-  const recent = PROBLEMS.slice(0, 10);
+test(`pickProblem: 復習でない字は直前 ${LAP_AVOID} 問に出ていれば避ける (2 周目の始まり)`, () => {
+  assert.equal(LAP_AVOID, 10);
+  const recent = ALL.slice(0, 10);
   for (let trial = 0; trial < 200; trial += 1) {
-    const next = pickExtra(recent);
-    assert.ok(!recent.includes(next), `${next.kanji} が直前 10 問と重なった`);
-  }
-  // 避ける数を超えた古い問題はまた出てよい
-  const many = PROBLEMS.slice(0, 20);
-  const avoided = new Set(many.slice(-10).map((p) => p.kanji));
-  for (let trial = 0; trial < 200; trial += 1) {
-    assert.ok(!avoided.has(pickExtra(many).kanji));
+    assert.ok(!recent.includes(pickProblem({ ...none, recent }).kanji));
   }
 });
 
-test('エクストラは避ける先が無くなっても 1 問返す', () => {
-  const next = pickExtra(PROBLEMS, () => 0, 80);
-  assert.ok(PROBLEMS.includes(next));
+test('pickProblem: 残りがみな最近出たばかりなら、いちばん前に出した字を選ぶ', () => {
+  const solved = new Set(ALL.filter((k) => k !== '山' && k !== '川'));
+  const recent = ['川', '一', '山'];
+  assert.equal(pickProblem({ solved, review: ['山', '川'], recent }, () => 0).kanji, '川');
+  assert.equal(pickProblem({ solved, review: [], recent: ['一', '川'] }, () => 0).kanji, '山', '出していない字を先に');
+});
+
+test('problemOf: 字から問題を引く。無ければ null', () => {
+  assert.equal(problemOf('山'), PROBLEMS.find((p) => p.kanji === '山'));
+  assert.equal(problemOf('鬱'), null);
+  assert.equal(problemOf(''), null);
 });

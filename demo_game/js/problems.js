@@ -1,4 +1,4 @@
-// 出題データ (小学 1 年の 80 字) と、ラウンドの組み立て。
+// 出題データ (小学 1 年の 80 字) と、次の 1 問の選び方。
 //
 // 1 件 = { kanji, reading, word, wordReading }
 //   kanji       書いてもらう 1 字
@@ -103,33 +103,49 @@ function pick(max, random) {
   return Math.min(max - 1, Math.floor(random() * max));
 }
 
-/**
- * 基本ラウンドの出題を作る。重複なしでランダムに count 問。
- *
- * @param {number} count 問題数
- * @param {() => number} random [0, 1) の乱数
- * @returns {object[]} PROBLEMS の要素
- */
-export function makeRound(count, random = Math.random) {
-  const pool = PROBLEMS.slice();
-  const out = [];
-  const n = Math.min(count, pool.length);
-  for (let i = 0; i < n; i += 1) {
-    out.push(pool.splice(pick(pool.length, random), 1)[0]);
-  }
-  return out;
-}
+/** ミス・パスで終わった字 (復習) は、ほかの字をこれだけ挟んでから再出題してよい */
+export const REPEAT_GAP = 3;
+/** 復習でない字は、直前のこれだけの問題に出ていれば避ける (2 周目の始まりで前の周の終わりと続かないように) */
+export const LAP_AVOID = 10;
+/** 選べる復習の字があるとき、それを選ぶ確率 (復習の優先度) */
+export const REVIEW_CHANCE = 0.5;
 
 /**
- * エクストラの 1 問を選ぶ。重複はしてよいが、直前 `avoidCount` 問と同じ字は避ける。
+ * 次の 1 問を選ぶ。
  *
- * @param {object[]} recent 直近に出した問題 (新しいものが末尾)
+ *   - このゲームで正解した字 (solved) は出さない。
+ *   - 復習の字 (ミス・パスで終わってまだ正解していない字) は、最近の REPEAT_GAP 問に出ていなければ選べる。
+ *     選べる復習の字があれば REVIEW_CHANCE の確率でそちらから選ぶ (まだ出していない字が無ければ必ず)。
+ *   - それ以外の字は、最近の LAP_AVOID 問に出ていなければ選べる。
+ *   - どれも選べない (残りの字がみな最近出たばかり) ときは、まだ正解していない字のうち
+ *     いちばん前に出した字 (出したことが無ければそれ) を選ぶ。
+ * 正解していない字が 1 つも無いとき (全部正解した) は呼び出し側が solved を空にして 2 周目に入る。
+ *
+ * @param {object} state
+ * @param {Set<string>} state.solved このゲームで正解した字
+ * @param {string[]} state.review 復習の字
+ * @param {string[]} state.recent 最近出した字 (古い順、末尾が今の問題)
  * @param {() => number} random [0, 1) の乱数
- * @param {number} avoidCount 避ける直前の問題数
+ * @returns {object} PROBLEMS の要素
  */
-export function pickExtra(recent, random = Math.random, avoidCount = 10) {
-  const avoid = new Set(recent.slice(-avoidCount).map((p) => p.kanji));
-  const pool = PROBLEMS.filter((p) => !avoid.has(p.kanji));
-  const from = pool.length === 0 ? PROBLEMS : pool;
+export function pickProblem({ solved, review, recent }, random = Math.random) {
+  const pool = PROBLEMS.filter((p) => !solved.has(p.kanji));
+  const reviewing = new Set(review);
+  const eligible = pool.filter((p) => {
+    const gap = reviewing.has(p.kanji) ? REPEAT_GAP : LAP_AVOID;
+    return !recent.slice(-gap).includes(p.kanji);
+  });
+  if (eligible.length === 0) {
+    const shownAt = (p) => recent.lastIndexOf(p.kanji);
+    return pool.reduce((best, p) => (shownAt(p) < shownAt(best) ? p : best), pool[0]);
+  }
+  const again = eligible.filter((p) => reviewing.has(p.kanji));
+  const fresh = eligible.filter((p) => !reviewing.has(p.kanji));
+  const from = again.length > 0 && (fresh.length === 0 || random() < REVIEW_CHANCE) ? again : fresh;
   return from[pick(from.length, random)];
+}
+
+/** 字から問題を引く。出題データに無ければ null (保存した出題順を戻すときに使う) */
+export function problemOf(kanji) {
+  return PROBLEMS.find((p) => p.kanji === kanji) ?? null;
 }

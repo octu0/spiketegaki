@@ -3,7 +3,7 @@
 // どれも DOM の数を先に作っておき、再生のたびにクラスと transform を付け替えるだけにする
 // (毎回の生成でごみが増えないようにするため)。形は SVG、動きは CSS と Web Animations。
 
-import { flowerPath } from './fx.js';
+import { flowerPath, spiralPaths } from './fx.js';
 import { collectedSlots } from './scoring.js';
 
 /** 枠のまわりに並べる電球の数 (辺ごとに 4 つ) */
@@ -18,8 +18,8 @@ const BULB_STRIDE = 4;
 const HANAMARU_DRAW_MS = 250;
 const HANAMARU_TOTAL_MS = 520;
 
-/** 書いた字が帯へ飛ぶ時間 (ms) */
-export const FLY_MS = 300;
+/** 虹色の渦巻きの色 (内側から) */
+const RAINBOW = ['#e24b4b', '#f08a24', '#f2c200', '#3fae5a', '#3d7fe0', '#6a4fd6', '#c04fc7'];
 
 /**
  * 枠の外側に電球を並べる位置 (百分率)。i を辺の長さで割って四辺に配る。
@@ -95,32 +95,49 @@ export class Lights {
   }
 }
 
-/** 正解の瞬間、筆記領域の上に赤い「はなまる」(花の輪郭 + 二重丸) を筆で描く */
+/**
+ * 正解の瞬間、筆記領域の上に赤い「はなまる」(花の輪郭 + 二重丸) を筆で描く。
+ * コンボが乗っているときは虹色の渦巻きに格上げする。
+ */
 export class Hanamaru {
   /** @param {HTMLElement} host 筆記領域に重ねる要素 */
   constructor(host) {
     this.host = host;
     host.innerHTML =
       `<svg viewBox="0 0 100 100" aria-hidden="true">`
+      + `<g class="hanamaru__maru">`
       + `<path class="hanamaru__flower" d="${flowerPath(8, 44, 31)}"/>`
       + `<circle class="hanamaru__ring" cx="50" cy="50" r="27"/>`
       + `<circle class="hanamaru__ring" cx="50" cy="50" r="20"/>`
-      + `</svg>`;
+      + `</g><g class="hanamaru__swirl">`
+      + spiralPaths(3, RAINBOW.length, 44)
+        .map((d, i) => `<path class="hanamaru__arc" d="${d}" style="stroke:${RAINBOW[i]}"/>`).join('')
+      + `</g></svg>`;
     this.flower = host.querySelector('.hanamaru__flower');
     this.rings = [...host.querySelectorAll('.hanamaru__ring')];
+    this.arcs = [...host.querySelectorAll('.hanamaru__arc')];
     this.fade = null;
   }
 
-  /** 1 回描く。花の輪郭 → 二重丸 の順に筆を走らせ、書き取りの丸付けらしく見せる */
-  play() {
+  /**
+   * 1 回描く。はなまるは花の輪郭 → 二重丸、渦巻きは内側から外へ、の順に筆を走らせる。
+   * @param {boolean} rainbow 虹色の渦巻きにするか
+   */
+  play(rainbow = false) {
     if (typeof this.host.animate !== 'function') {
       return;
     }
     this.host.classList.add('hanamaru--on');
-    this.draw(this.flower, 0, HANAMARU_DRAW_MS * 0.64);
-    this.rings.forEach((ring, i) => {
-      this.draw(ring, HANAMARU_DRAW_MS * (0.44 + i * 0.16), HANAMARU_DRAW_MS * 0.4);
-    });
+    this.host.classList.toggle('hanamaru--rainbow', rainbow);
+    if (rainbow) {
+      const step = HANAMARU_DRAW_MS / this.arcs.length;
+      this.arcs.forEach((arc, i) => this.draw(arc, step * i, step));
+    } else {
+      this.draw(this.flower, 0, HANAMARU_DRAW_MS * 0.64);
+      this.rings.forEach((ring, i) => {
+        this.draw(ring, HANAMARU_DRAW_MS * (0.44 + i * 0.16), HANAMARU_DRAW_MS * 0.4);
+      });
+    }
     if (this.fade !== null) {
       this.fade.cancel();
     }
@@ -175,13 +192,13 @@ export class Wipe {
 
 /**
  * 「あつめた字」の帯。ラウンドの 10 枠を空カードで見せ、正解するたびに
- * 書いた字がそのままカードになって埋まる。エクストラでは枠が増えて横に伸びる。
+ * 書いた字がそのままカードになって埋まる。ステージをまたいで 10 を越えると枠が増えて横に伸びる。
+ * 字を帯まで運ぶのは観客の腕 (crowd.js の carry)。ここは枠の予約と、着いたときの表示だけを持つ。
  */
 export class Collected {
   /** @param {HTMLElement} host 帯の中身を入れる要素 */
-  constructor(host, flightHost) {
+  constructor(host) {
     this.host = host;
-    this.flightHost = flightHost;
     this.slots = [];
     this.count = 0;
     this.reset();
@@ -205,60 +222,53 @@ export class Collected {
     }
   }
 
-  /** 次に埋まる枠 */
-  nextSlot() {
+  /**
+   * 次に埋まる枠を押さえる。伸びた帯は、その枠が見えるところまで先に寄せておく
+   * (運ぶ先の位置がずれないように)。
+   * @returns {HTMLElement}
+   */
+  reserve() {
     this.grow(collectedSlots(this.count + 1));
-    return this.slots[this.count];
+    const slot = this.slots[this.count];
+    this.count += 1;
+    this.host.scrollLeft = Math.max(0, slot.offsetLeft - this.host.clientWidth + slot.offsetWidth + 8);
+    return slot;
   }
 
   /**
-   * 書いた字を帯へ飛ばして収める。
-   * @param {string} dataUrl 筆記領域を写した画像
-   * @param {DOMRect} from 飛び立つ位置 (筆記領域)
+   * つづきから: 保存してあった字 (画像は保存しないので活字) で枠を埋め直す。
+   * @param {string[]} chars あつめた字
    */
-  collect(dataUrl, from) {
-    const slot = this.nextSlot();
-    this.count += 1;
-    const to = slot.getBoundingClientRect();
-    const flyer = document.createElement('img');
-    flyer.className = 'flyer';
-    flyer.src = dataUrl;
-    flyer.alt = '';
-    flyer.style.width = `${from.width}px`;
-    flyer.style.height = `${from.height}px`;
-    this.flightHost.append(flyer);
-
-    const x0 = from.x + from.width / 2;
-    const y0 = from.y + from.height / 2;
-    const x1 = to.x + to.width / 2;
-    const y1 = to.y + to.height / 2;
-    // 山なりに飛ばす (2 次ベジェ。制御点は中点の少し上)
-    const cx = (x0 + x1) / 2;
-    const cy = Math.min(y0, y1) - Math.abs(y1 - y0) * 0.35 - 40;
-    const scale0 = from.width > 0 ? Math.min(1, to.width / from.width) : 0.2;
-    const started = performance.now();
-    const step = (now) => {
-      const t = Math.min(1, (now - started) / FLY_MS);
-      const u = 1 - t;
-      const x = u * u * x0 + 2 * u * t * cx + t * t * x1;
-      const y = u * u * y0 + 2 * u * t * cy + t * t * y1;
-      const s = 1 + (scale0 - 1) * t;
-      flyer.style.transform = `translate(${x}px, ${y}px) translate(-50%, -50%) scale(${s.toFixed(3)})`;
-      if (t < 1) {
-        window.requestAnimationFrame(step);
-        return;
-      }
-      flyer.remove();
+  restore(chars) {
+    this.reset();
+    this.grow(collectedSlots(chars.length));
+    chars.forEach((ch, i) => {
+      const slot = this.slots[i];
       slot.classList.add('slot--filled');
-      slot.replaceChildren(makeCard(dataUrl));
-      slot.classList.remove('slot--pop');
-      void slot.offsetWidth;
-      slot.classList.add('slot--pop');
-      // エクストラで伸びた帯は、いま埋めたカードが見えるところまで寄せる
-      this.host.scrollLeft = Math.max(0, slot.offsetLeft - this.host.clientWidth + slot.offsetWidth + 8);
-    };
-    flyer.style.transform = `translate(${x0}px, ${y0}px) translate(-50%, -50%)`;
-    window.requestAnimationFrame(step);
+      const span = document.createElement('span');
+      span.className = 'slot__char';
+      span.textContent = ch;
+      slot.replaceChildren(span);
+    });
+    this.count = chars.length;
+    const last = this.slots[Math.max(0, this.count - 1)];
+    this.host.scrollLeft = Math.max(0, last.offsetLeft - this.host.clientWidth + last.offsetWidth + 8);
+  }
+
+  /**
+   * 運ばれてきた字を枠に収める。
+   * @param {HTMLElement} slot reserve() で押さえた枠
+   * @param {string} dataUrl 筆記領域を写した画像
+   */
+  land(slot, dataUrl) {
+    if (!slot.isConnected) {
+      return;
+    }
+    slot.classList.add('slot--filled');
+    slot.replaceChildren(makeCard(dataUrl));
+    slot.classList.remove('slot--pop');
+    void slot.offsetWidth;
+    slot.classList.add('slot--pop');
   }
 }
 

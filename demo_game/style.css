@@ -22,6 +22,8 @@
   --shadow-sm: 3px 3px 0 var(--navy);
 }
 
+[hidden] { display: none !important; }
+
 * {
   box-sizing: border-box;
   /* iOS Safari の長押しで選択とコールアウト (コピー / 調べる) が出るのを止める */
@@ -75,6 +77,22 @@ body {
   will-change: transform;
 }
 
+/* 観客と飾りの canvas (筆記領域の枠内は JS が切り抜く)。操作は透過させる。
+   back はプレイ画面のカード (z-index 4) より下で、観客はカードの後ろからのぞく (文字を隠さない)。
+   front はカードより上 (判定バースト・はなまる・ワイプの z-index 5〜7 よりも上) */
+.overlay {
+  position: absolute;
+  left: 0;
+  top: 0;
+  width: 100%;
+  height: 100dvh;
+  pointer-events: none;
+}
+.overlay--back { z-index: 3; }
+.overlay--front { z-index: 8; }
+/* プレイ画面のカードは観客 (back) の手前に置く */
+.hudwrap, .meter, .timer, .collected, .question, .controls { position: relative; z-index: 4; }
+
 .screen {
   display: none;
   max-width: 480px;
@@ -86,6 +104,7 @@ body {
     calc(16px + env(safe-area-inset-left));
 }
 .screen--on { display: block; }
+#screen-play { position: relative; }
 
 /* MARK: - 共通の部品 */
 
@@ -121,6 +140,10 @@ h1 {
 .lead { margin: 0 0 6px; color: var(--ink); font-size: .88rem; }
 .boot { min-height: 1.4em; margin: 0; font-size: .82rem; color: var(--sub); }
 .title .card { padding: 10px 12px; margin-bottom: 12px; }
+/* 保存があれば「つづきから」(大) と「さいしょから」、無ければ「はじめる」だけ */
+.startbuttons { display: flex; flex-direction: column; align-items: center; gap: 8px; }
+.continue__info { display: block; font-size: .72rem; font-weight: 700; color: var(--sub); line-height: 1.2; }
+#continueButton { padding: 6px 24px; }
 
 button {
   font: inherit;
@@ -181,7 +204,7 @@ button.ghost { background: var(--cream); color: var(--sub); }
 
 .hud {
   display: grid;
-  grid-template-columns: repeat(4, 1fr);
+  grid-template-columns: repeat(5, 1fr);
   gap: 5px;
   padding: 2px 2px 8px;
 }
@@ -192,12 +215,16 @@ button.ghost { background: var(--cream); color: var(--sub); }
   border-radius: 12px;
   box-shadow: var(--shadow-sm);
 }
-.hud__label { display: block; font-size: .6rem; color: var(--sub); }
+.hud__label { display: block; font-size: .6rem; color: var(--sub); white-space: nowrap; }
+@media (max-width: 340px) {
+  .hud__label { font-size: .52rem; }
+}
 .hud__value {
   display: inline-block;
-  font-size: 1rem;
+  font-size: .92rem;
   font-weight: 700;
   font-variant-numeric: tabular-nums;
+  white-space: nowrap;
 }
 .hud__value--pop { animation: pop 320ms ease; }
 .hud__value--bounce { animation: bounce 150ms ease; }
@@ -244,14 +271,22 @@ button.ghost { background: var(--cream); color: var(--sub); }
   transform-origin: left center;
   transition: background 200ms linear;
 }
-.timer__bar--low { background: var(--pink); }
+.timer__bar--low { background: #e24b4b; animation: timerPulse 500ms ease-in-out infinite alternate; }
+@keyframes timerPulse {
+  from { opacity: 1; }
+  to   { opacity: .45; }
+}
+
+/* 観客が並ぶ帯 (中身は空。高さだけを確保する)。帯を広くとるぶん、あつめた字・問題・ボタンの上の
+   余白を詰めている (筆記領域の大きさは変えない) */
+.crowdband { height: 50px; }
 
 .question {
   display: flex;
   align-items: center;
   justify-content: center;
   gap: 8px;
-  margin: 8px 0 2px;
+  margin: 4px 0 2px;
   padding: 6px 10px;
 }
 .question__text { flex: 1 1 auto; min-width: 0; text-align: center; }
@@ -368,12 +403,21 @@ button.ghost { background: var(--cream); color: var(--sub); }
   display: grid;
   grid-template-columns: repeat(3, 1fr);
   gap: 8px;
-  margin-top: 12px;
+  margin-top: 10px;
 }
 .controls > button { padding: 8px 4px; font-size: .95rem; }
 .controls > .big { grid-column: 1 / -1; }
 .controls > .ghost { font-size: .88rem; }
-.controls--result { grid-template-columns: 1fr 1fr; margin-top: 14px; }
+.controls--result { grid-template-columns: 1fr 1fr; margin-top: 8px; }
+.pass__left {
+  display: inline-block;
+  min-width: 1.4em;
+  margin-left: 2px;
+  border-radius: 8px;
+  background: var(--cream);
+  font-size: .8rem;
+  font-variant-numeric: tabular-nums;
+}
 
 /* MARK: - 浮かぶ得点と、節目のバナー */
 
@@ -386,9 +430,9 @@ button.ghost { background: var(--cream); color: var(--sub); }
 .float {
   position: absolute;
   transform: translate(-50%, -50%);
-  font-size: 1.5rem;
-  font-weight: 800;
-  color: #fff;
+  font-size: 2.2rem;
+  font-weight: 900;
+  color: var(--yellow);
   white-space: nowrap;
   text-shadow:
     -2px -2px 0 var(--navy), 0 -2px 0 var(--navy), 2px -2px 0 var(--navy),
@@ -397,7 +441,7 @@ button.ghost { background: var(--cream); color: var(--sub); }
     4px 5px 0 var(--navy);
   animation: floatUp 1100ms ease-out forwards;
 }
-.float--dopa { font-size: 1.15rem; color: var(--purple); animation-duration: 1300ms; }
+.float--dopa { font-size: 1.55rem; color: var(--purple); animation-duration: 1300ms; }
 
 .banner {
   position: fixed;
@@ -423,9 +467,8 @@ button.ghost { background: var(--cream); color: var(--sub); }
 }
 .banner--show { animation: banner 1800ms ease-out; }
 
-/* MARK: - 結果 */
+/* MARK: - 結果 (ゲームオーバー) */
 
-.result { text-align: center; }
 .result__score {
   margin: 8px 0 4px;
   font-size: clamp(2.8rem, 16vw, 3.6rem);
@@ -440,11 +483,12 @@ h2 { font-size: clamp(1.5rem, 7vw, 2rem); margin: 6px 0 2px; color: var(--pink);
 
 .mascot-slot { width: 60px; flex: 0 0 auto; }
 .mascot-slot--big { width: 116px; margin: 2px auto 0; }
+.mascot-slot--mid { width: 64px; margin: 0 auto; }
 .mascot__svg { width: 100%; height: auto; display: block; }
 .mascot { --mascot-amp: 1; transform-origin: 50% 100%; }
 
 /* 表情の出し分け。既定は笑顔、驚き / 喜び のときだけ差し替える */
-.mascot__face--surprised, .mascot__face--joy { display: none; }
+.mascot__face--surprised, .mascot__face--joy, .mascot__face--sad { display: none; }
 .mascot--sad .mascot__face--smile, .mascot--wobble .mascot__face--smile { display: none; }
 .mascot--sad .mascot__face--surprised, .mascot--wobble .mascot__face--surprised { display: inline; }
 .mascot--happy .mascot__face--smile, .mascot--cheer .mascot__face--smile,
@@ -463,6 +507,10 @@ h2 { font-size: clamp(1.5rem, 7vw, 2rem); margin: 6px 0 2px; color: var(--pink);
 .mascot--spin { animation: spin 1000ms cubic-bezier(.3, 1.2, .5, 1); }
 /* 巨大化は中心から広げる (画面の上端からはみ出しにくい) */
 .mascot--giant { animation: giant 2200ms ease; transform-origin: 50% 45%; }
+/* ゲームオーバー: しょんぼり座り込む (次の反応まで続く) */
+.mascot--gloom { transform: translateY(8px) scale(1.08, .86); transition: transform 400ms ease; }
+.mascot--gloom .mascot__face--smile { display: none; }
+.mascot--gloom .mascot__face--sad { display: inline; }
 
 /* 正解で腕を上げる */
 .mascot__arms { transform-box: fill-box; transform-origin: 50% 20%; }
@@ -565,9 +613,11 @@ h2 { font-size: clamp(1.5rem, 7vw, 2rem); margin: 6px 0 2px; color: var(--pink);
   .mascot--dance, .mascot--spin, .mascot--giant,
   .hud__value--pop, .hud__value--bounce, .verdict--show,
   .float, .banner--show, .flash--on,
-  .mascot--clap, .mascot--lean, .fan--hop, .fan--startle, .fan--jump,
+  .mascot--clap, .mascot--lean,
   .slot--pop, .wipe--on .wipe__ink, .wipe--on .wipe__band, .reach--pulse, .question__text--in,
-  .parade--on, .parade--on .parade__member, .lights--rainbow .bulb { animation-duration: 1ms; }
+  .lights--rainbow .bulb, .sash--show, .bignum--show,
+  .countdown--show, .hurt--on, .heart--break .heart__half, .heart--refill, .answer--on,
+  .gameover--in, .timer__bar--low { animation-duration: 1ms; }
 }
 
 
@@ -607,7 +657,7 @@ h2 { font-size: clamp(1.5rem, 7vw, 2rem); margin: 6px 0 2px; color: var(--pink);
 .collected {
   display: flex;
   gap: 4px;
-  margin: 6px 0 0;
+  margin: 0;
   padding: 3px 2px;
   overflow-x: auto;
   overflow-y: hidden;
@@ -630,20 +680,6 @@ h2 { font-size: clamp(1.5rem, 7vw, 2rem); margin: 6px 0 2px; color: var(--pink);
   0%   { transform: scale(.4) rotate(-12deg); }
   60%  { transform: scale(1.22) rotate(4deg); }
   100% { transform: scale(1) rotate(0); }
-}
-
-/* 帯へ飛んでいく「書いた字」 */
-.flights {
-  position: fixed;
-  inset: 0;
-  pointer-events: none;
-  z-index: 6;
-}
-.flyer {
-  position: absolute;
-  left: 0;
-  top: 0;
-  will-change: transform;
 }
 
 /* MARK: - 電飾 (強度が高いときだけ点ける) */
@@ -736,86 +772,15 @@ h2 { font-size: clamp(1.5rem, 7vw, 2rem); margin: 6px 0 2px; color: var(--pink);
   stroke-linejoin: round;
 }
 .hanamaru__ring { stroke-width: 4.2; }
-
-/* MARK: - 観客 */
-
-.fans {
-  display: flex;
-  justify-content: center;
-  align-items: flex-end;
-  gap: 2px;
-  margin-top: 4px;
-  height: 34px;
-  transition: transform 220ms ease;
-}
-.fans--lean { transform: translateY(3px) scale(1.06); }
-.fan {
-  width: 30px;
-  flex: 0 0 auto;
-  transform-origin: 50% 100%;
-}
-.fan .mascot__svg { width: 100%; height: auto; display: block; }
-/* 観客は表情を 1 つに絞る (小さいので描き分けが効かない) */
-.fan .mascot__face--surprised, .fan .mascot__face--joy { display: none; }
-.fan--hop { animation: fanHop 500ms cubic-bezier(.3, 1.4, .5, 1); }
-.fan--startle { animation: fanStartle 500ms ease; }
-.fan--jump { animation: fanJump 1200ms ease; }
-@keyframes fanHop {
-  0%, 100% { transform: translateY(0) scale(1, 1); }
-  30%  { transform: translateY(-13px) scale(.92, 1.1); }
-  65%  { transform: translateY(0) scale(1.08, .92); }
-}
-@keyframes fanStartle {
-  0%, 100% { transform: translateY(0) scale(1, 1); }
-  25%  { transform: translateY(5px) scale(1.16, .72); }
-  60%  { transform: translateY(0) scale(.94, 1.04); }
-}
-/* 節目: 両手を上げて連続ジャンプ */
-@keyframes fanJump {
-  0%, 100% { transform: translateY(0) rotate(0); }
-  12%  { transform: translateY(-16px) rotate(-6deg); }
-  25%  { transform: translateY(0) rotate(0); }
-  37%  { transform: translateY(-16px) rotate(6deg); }
-  50%  { transform: translateY(0) rotate(0); }
-  62%  { transform: translateY(-16px) rotate(-6deg); }
-  75%  { transform: translateY(0) rotate(0); }
-  87%  { transform: translateY(-12px) rotate(4deg); }
-}
-.fan--jump .mascot__arms { animation: armsUp 400ms ease infinite; }
-
-/* MARK: - パレード (完走と大きな節目) */
-
-.parade {
-  position: fixed;
-  left: 0;
-  right: 0;
-  bottom: calc(6px + env(safe-area-inset-bottom));
-  display: flex;
-  gap: 6px;
-  padding-left: 8px;
-  pointer-events: none;
-  z-index: 5;
-  opacity: 0;
-}
-.parade--on { opacity: 1; animation: paradeMarch 2500ms linear; }
-.parade__member {
-  width: 40px;
-  flex: 0 0 auto;
-  transform-origin: 50% 100%;
-}
-.parade__member .mascot__svg { width: 100%; height: auto; display: block; }
-.parade__member .mascot__face--surprised, .parade__member .mascot__face--joy { display: none; }
-.parade--on .parade__member {
-  animation: paradeStep 320ms ease-in-out infinite;
-  animation-delay: var(--march-delay, 0ms);
-}
-@keyframes paradeMarch {
-  0%   { opacity: 1; transform: translateX(-110%); }
-  100% { opacity: 1; transform: translateX(110%); }
-}
-@keyframes paradeStep {
-  0%, 100% { transform: translateY(0) rotate(-4deg); }
-  50% { transform: translateY(-8px) rotate(4deg); }
+/* コンボ中は虹色の渦巻きに格上げ (色は 1 本ずつ JS が付ける) */
+.hanamaru__swirl { display: none; }
+.hanamaru--rainbow .hanamaru__maru { display: none; }
+.hanamaru--rainbow .hanamaru__swirl { display: inline; }
+.hanamaru__arc {
+  fill: none;
+  stroke-width: 5.5;
+  stroke-linecap: round;
+  stroke-linejoin: round;
 }
 
 /* MARK: - マスコットの追加の反応 */
@@ -848,4 +813,262 @@ h2 { font-size: clamp(1.5rem, 7vw, 2rem); margin: 6px 0 2px; color: var(--pink);
 @keyframes slideIn {
   0%   { opacity: 0; transform: translateX(-26px); }
   100% { opacity: 1; transform: translateX(0); }
+}
+
+/* MARK: - 横断バナー (ラスト1もん / 100てん! / EX n) */
+
+.sash {
+  position: fixed;
+  left: -10%;
+  width: 120%;
+  top: var(--sash-y, 24%);
+  height: 68px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-top: 4px solid var(--navy);
+  border-bottom: 4px solid var(--navy);
+  background: repeating-linear-gradient(135deg, #2b2e5a 0 16px, #43488a 16px 32px);
+  box-shadow: 0 6px 0 rgba(43, 46, 90, .35);
+  opacity: 0;
+  pointer-events: none;
+  z-index: 6;
+  transform: translate(-100%, -50%) rotate(-7deg);
+}
+.sash__text {
+  font-size: clamp(2.1rem, 12vw, 3rem);
+  font-weight: 900;
+  color: #fff;
+  letter-spacing: .06em;
+  white-space: nowrap;
+  text-shadow:
+    -3px -3px 0 var(--navy), 0 -3px 0 var(--navy), 3px -3px 0 var(--navy),
+    3px 0 0 var(--navy), 3px 3px 0 var(--navy), 0 3px 0 var(--navy),
+    -3px 3px 0 var(--navy), -3px 0 0 var(--navy),
+    5px 6px 0 #e0407a;
+}
+/* 左から入って少し留まり、右へ抜ける (合計 700 ms、進行は止めない) */
+.sash--show { animation: sashCross 700ms cubic-bezier(.2, .8, .3, 1) forwards; }
+@keyframes sashCross {
+  0%   { opacity: 1; transform: translate(-100%, -50%) rotate(-7deg); }
+  24%  { opacity: 1; transform: translate(0, -50%) rotate(-7deg); }
+  76%  { opacity: 1; transform: translate(4%, -50%) rotate(-7deg); }
+  100% { opacity: 1; transform: translate(100%, -50%) rotate(-7deg); }
+}
+
+/* MARK: - ドパの節目の巨大ステッカー数字 (1万 / 10万 …) */
+
+.bignum {
+  position: fixed;
+  left: 50%;
+  top: var(--bignum-y, 26%);
+  font-size: clamp(3.6rem, 22vw, 5.4rem);
+  font-weight: 900;
+  line-height: 1;
+  color: var(--yellow);
+  white-space: nowrap;
+  opacity: 0;
+  pointer-events: none;
+  z-index: 6;
+  transform: translate(-50%, -50%);
+  text-shadow:
+    -4px -4px 0 var(--navy), 0 -4px 0 var(--navy), 4px -4px 0 var(--navy),
+    4px 0 0 var(--navy), 4px 4px 0 var(--navy), 0 4px 0 var(--navy),
+    -4px 4px 0 var(--navy), -4px 0 0 var(--navy),
+    8px 10px 0 var(--navy);
+}
+.bignum--show { animation: bignum 1500ms ease-out; }
+@keyframes bignum {
+  0%   { opacity: 0; transform: translate(-50%, -50%) scale(.2) rotate(-14deg); }
+  12%  { opacity: 1; transform: translate(-50%, -50%) scale(1.3) rotate(5deg); }
+  22%  { transform: translate(-50%, -50%) scale(.9) rotate(-4deg); }
+  31%  { transform: translate(-50%, -50%) scale(1.07) rotate(1deg); }
+  40%  { transform: translate(-50%, -50%) scale(1) rotate(-3deg); }
+  82%  { opacity: 1; transform: translate(-50%, -50%) scale(1) rotate(-3deg); }
+  100% { opacity: 0; transform: translate(-50%, -85%) scale(1.05) rotate(-3deg); }
+}
+
+/* MARK: - ライフ (ハート 3 つ。ミスで左右に割れて落ちる) */
+
+.lives { display: inline-flex; gap: 2px; align-items: center; height: 1.5em; }
+.heart { display: inline-block; width: 15px; height: 14px; }
+.heart svg { width: 100%; height: 100%; display: block; overflow: visible; }
+.heart__whole, .heart__half {
+  fill: #e24b4b;
+  stroke: var(--navy);
+  stroke-width: 2;
+  stroke-linejoin: round;
+  transform-box: fill-box;
+}
+.heart__half { display: none; }
+.heart--break .heart__whole { display: none; }
+.heart--break .heart__half { display: inline; }
+.heart__half--l { transform-origin: 100% 100%; }
+.heart__half--r { transform-origin: 0 100%; }
+.heart--break .heart__half--l { animation: heartL 600ms cubic-bezier(.4, 0, .8, .6) forwards; }
+.heart--break .heart__half--r { animation: heartR 600ms cubic-bezier(.4, 0, .8, .6) forwards; }
+@keyframes heartL {
+  0%   { transform: none; }
+  20%  { transform: scale(1.3); }
+  100% { transform: translate(-6px, 14px) rotate(-40deg); opacity: 0; }
+}
+@keyframes heartR {
+  0%   { transform: none; }
+  20%  { transform: scale(1.3); }
+  100% { transform: translate(6px, 14px) rotate(40deg); opacity: 0; }
+}
+/* 割れたあとは輪郭だけが残る */
+.heart--lost .heart__whole { display: inline; fill: none; stroke: #b9bcd6; }
+.heart--lost .heart__half { display: none; }
+.heart--refill { animation: heartRefill 420ms cubic-bezier(.3, 1.6, .5, 1); }
+@keyframes heartRefill {
+  0%   { transform: scale(.2); }
+  100% { transform: scale(1); }
+}
+
+/* ハートが割れた瞬間、画面が一瞬赤くなる (揺れは fx.js の jolt) */
+.hurt {
+  position: fixed;
+  inset: 0;
+  background: radial-gradient(ellipse at center, rgba(226, 75, 75, .15), rgba(226, 75, 75, .55));
+  opacity: 0;
+  pointer-events: none;
+  z-index: 9;
+}
+.hurt--on { animation: hurt 320ms ease-out; }
+@keyframes hurt {
+  0%   { opacity: 0; }
+  20%  { opacity: 1; }
+  100% { opacity: 0; }
+}
+
+/* MARK: - カウントダウン (残り 5 秒から 5, 4, 3, 2, 1。数字ごとに赤へ近づく) */
+
+.countdown {
+  position: fixed;
+  left: 50%;
+  top: var(--countdown-y, 50%);
+  font-size: clamp(7rem, 44vw, 10rem);
+  font-weight: 900;
+  line-height: 1;
+  color: var(--yellow);
+  opacity: 0;
+  pointer-events: none;
+  z-index: 6;
+  transform: translate(-50%, -50%);
+  font-variant-numeric: tabular-nums;
+  text-shadow:
+    -5px -5px 0 var(--navy), 0 -5px 0 var(--navy), 5px -5px 0 var(--navy),
+    5px 0 0 var(--navy), 5px 5px 0 var(--navy), 0 5px 0 var(--navy),
+    -5px 5px 0 var(--navy), -5px 0 0 var(--navy),
+    10px 12px 0 var(--navy);
+}
+.countdown[data-n="5"] { color: #f9d65c; }
+.countdown[data-n="4"] { color: #f7b441; }
+.countdown[data-n="3"] { color: #f08a24; }
+.countdown[data-n="2"] { color: #ea5a2c; }
+.countdown[data-n="1"] { color: #e0302a; }
+/* スケールインして揺れ、書いている字が透けて見えるよう薄くなって残る (1 秒) */
+.countdown--show { animation: countdown 1000ms ease-out forwards; }
+@keyframes countdown {
+  0%   { opacity: 0; transform: translate(-50%, -50%) scale(2.2) rotate(-12deg); }
+  14%  { opacity: 1; transform: translate(-50%, -50%) scale(.9) rotate(6deg); }
+  24%  { opacity: 1; transform: translate(-50%, -50%) scale(1.08) rotate(-4deg); }
+  34%  { opacity: .9; transform: translate(-50%, -50%) scale(1) rotate(2deg); }
+  100% { opacity: .38; transform: translate(-50%, -50%) scale(.94) rotate(0); }
+}
+
+/* MARK: - 時間切れの こたえ (800 ms) */
+
+.answer {
+  position: absolute;
+  inset: 0;
+  z-index: 6;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  background: rgba(255, 255, 255, .92);
+  opacity: 0;
+  pointer-events: none;
+}
+.answer--on { animation: answer 800ms ease-out forwards; }
+@keyframes answer {
+  0%   { opacity: 0; transform: scale(.9); }
+  15%  { opacity: 1; transform: scale(1.03); }
+  25%  { transform: scale(1); }
+  88%  { opacity: 1; }
+  100% { opacity: 0; }
+}
+.answer__label {
+  font-size: .95rem;
+  font-weight: 800;
+  color: #e0302a;
+}
+.answer__char {
+  font-family: serif;
+  font-size: calc(var(--pad-size) * .6);
+  line-height: 1.05;
+  color: var(--navy);
+}
+
+/* MARK: - ゲームオーバー (プレイ画面の上、あつめた字の帯から下に重ねる) */
+
+.gameover {
+  position: absolute;
+  left: calc(16px + env(safe-area-inset-left));
+  right: calc(16px + env(safe-area-inset-right));
+  bottom: calc(12px + env(safe-area-inset-bottom));
+  z-index: 9;
+  display: flex;
+  flex-direction: column;
+  padding: 6px 12px 10px;
+  text-align: center;
+  overflow: hidden;
+}
+.gameover h2 { margin: 0; }
+.gameover .result__score { margin: 0; font-size: clamp(2.2rem, 12vw, 2.8rem); }
+.records--result { margin: 2px 0 0; padding: 0; gap: 2px 10px; }
+.records--result div { min-width: 72px; }
+.gameover__label { margin: 4px 0 2px; font-size: .75rem; font-weight: 700; color: var(--sub); }
+/* あつめた字 (活字)。多いときは横にスクロール */
+.gameover__chars {
+  display: flex;
+  gap: 3px;
+  justify-content: safe center;
+  min-height: 30px;
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+.gameover__chars::-webkit-scrollbar { display: none; }
+.gameover__char {
+  flex: 0 0 auto;
+  width: 28px;
+  height: 28px;
+  border: 2px solid var(--navy);
+  border-radius: 6px;
+  background: var(--paper);
+  font-family: serif;
+  font-size: 1.1rem;
+  line-height: 24px;
+}
+.gameover .result__best { margin: 4px 0 0; min-height: 1.2em; }
+/* 低い画面ではマスコットを外して、ボタンまで収める */
+@media (max-height: 620px) {
+  .gameover .mascot-slot { display: none; }
+}
+.gameover--in { animation: gameoverIn 360ms cubic-bezier(.3, 1.4, .5, 1); }
+@keyframes gameoverIn {
+  0%   { opacity: 0; transform: translateY(40px) scale(.9); }
+  100% { opacity: 1; transform: none; }
+}
+
+/* つづきから で戻した あつめた字 (画像は保存しないので活字) */
+.slot__char {
+  display: block;
+  font-family: serif;
+  font-size: 1.1rem;
+  line-height: 25px;
+  text-align: center;
+  color: var(--navy);
 }

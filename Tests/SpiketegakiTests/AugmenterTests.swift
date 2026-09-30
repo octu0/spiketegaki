@@ -174,14 +174,16 @@ final class AugmenterTests: XCTestCase {
     /// 平行移動 ±5px は 2026-09-25 に ±2px から広げたもの。
     /// 拡縮は 0.85〜1.1 → 0.7〜1.15 → (2026-09-25) 0.60〜1.15。
     /// 小書き仮名を語彙から外した (2026-09-28) のでクラス別の範囲は持たず 1 本に戻した。
-    /// 膨張 1〜2px (等確率) / 確率 0.6 も 2026-09-25 に 1px / 確率 1/3 から強化したもの。
+    /// 膨張 1〜2px (等確率)。確率は 1/3 → (2026-09-25) 0.6 → (2026-09-29) 0.3。
+    /// 0.3 は線幅の実測による: マス目に切り出した手書きの線幅 (32x32 上、中央値 3.28px) に対し、
+    /// 確率 0.6 の学習データは 4.28px と太すぎ、0.3 で 3.41px になる。
     func testDefaultParametersMatchTheDesignedRanges() {
         let p = Augmenter.Parameters()
         XCTAssertEqual(p.shearRange, -0.3 ... 0.3)
         XCTAssertEqual(p.rotationDegreesRange, -10.0 ... 10.0)
         XCTAssertEqual(p.translationRange, -5.0 ... 5.0, "平行移動は ±5px")
         XCTAssertEqual(p.scaleRange, 0.60 ... 1.15, "拡縮は 0.60〜1.15")
-        XCTAssertEqual(p.thicknessProbability, 0.6, accuracy: 1e-7, "膨張の確率は 0.6")
+        XCTAssertEqual(p.thicknessProbability, 0.3, accuracy: 1e-7, "膨張の確率は 0.3")
         XCTAssertEqual(p.maxDilationPixels, 2, "膨張は 1〜2px の等確率")
         XCTAssertEqual(p.elasticAmplitude, 1.5)
         XCTAssertEqual(p.elasticSigma, 4.0)

@@ -190,6 +190,103 @@ final class CharacterClassifierTests: XCTestCase {
         }
     }
 
+    // MARK: - 区分マスク (認識モード)
+
+    /// ひらがなだけを指定すると top-k が全部ひらがなになり、確率の和が 1 になる
+    func testCategoryMaskKeepsOnlyRequestedCategory() throws {
+        let classifier = try makeClassifier()
+        let image = try sampleImage()
+        let hiragana = vocabulary.range(of: .hiragana)
+
+        let top = try classifier.classify(image: image, topK: 5, categories: [.hiragana])
+        XCTAssertEqual(top.count, 5)
+        for e in top {
+            XCTAssertEqual(vocabulary.category(of: e.index), .hiragana, "ひらがな以外が出た: \(e.character)")
+            XCTAssertTrue(hiragana.contains(e.index))
+        }
+
+        // 指定区分だけで確率の総和が 1、区分外はちょうど 0
+        let probs = try classifier.probabilities(for: image, categories: [.hiragana])
+        XCTAssertEqual(probs.count, vocabulary.count)
+        var inside: Double = 0.0
+        var outside: Double = 0.0
+        for (i, p) in probs.enumerated() {
+            XCTAssertFalse(p.isNaN)
+            if hiragana.contains(i) {
+                inside += Double(p)
+            } else {
+                outside += Double(p)
+            }
+        }
+        XCTAssertEqual(inside, 1.0, accuracy: 1e-4, "指定区分の確率の総和が 1 でない: \(inside)")
+        XCTAssertEqual(outside, 0.0, "区分外の確率が 0 でない: \(outside)")
+    }
+
+    /// 全区分を明示しても、空集合 (既定 = 全部) と同じ結果になる
+    func testAllCategoriesEqualsEmptySet() throws {
+        let classifier = try makeClassifier()
+        let image = try sampleImage()
+        let all = Set(ScriptCategory.allCases)
+
+        let viaAll = try classifier.classify(image: image, topK: 10, categories: all)
+        let viaEmpty = try classifier.classify(image: image, topK: 10, categories: [])
+        let viaDefault = try classifier.classify(image: image, topK: 10)
+        XCTAssertEqual(viaAll.map { $0.index }, viaEmpty.map { $0.index })
+        XCTAssertEqual(viaAll.map { $0.probability }, viaEmpty.map { $0.probability })
+        XCTAssertEqual(viaAll.map { $0.index }, viaDefault.map { $0.index })
+        XCTAssertEqual(viaAll.map { $0.probability }, viaDefault.map { $0.probability })
+
+        XCTAssertEqual(
+            try classifier.probabilities(for: image, categories: all),
+            try classifier.probabilities(for: image)
+        )
+    }
+
+    /// 区分を指定すると topK はその区分の候補数に丸められる
+    func testCategoryMaskClampsTopKToCandidateCount() throws {
+        let classifier = try makeClassifier()
+        let image = try sampleImage()
+        let n = vocabulary.range(of: .digits).count
+        XCTAssertEqual(n, 10)
+        let top = try classifier.classify(image: image, topK: n + 100, categories: [.digits])
+        XCTAssertEqual(top.count, n)
+        XCTAssertEqual(Set(top.map { $0.index }), Set(vocabulary.range(of: .digits)))
+        var sum: Double = 0.0
+        for e in top {
+            sum += Double(e.probability)
+        }
+        XCTAssertEqual(sum, 1.0, accuracy: 1e-4)
+    }
+
+    /// 複数区分 (英数モード) は指定した区分の和集合から出る
+    func testCategoryMaskAcceptsMultipleCategories() throws {
+        let classifier = try makeClassifier()
+        let image = try sampleImage()
+        let alnum: Set<ScriptCategory> = [.digits, .asciiSymbols, .latinUpper, .latinLower]
+        let top = try classifier.classify(image: image, topK: 20, categories: alnum)
+        XCTAssertEqual(top.count, 20)
+        for e in top {
+            XCTAssertTrue(alnum.contains(vocabulary.category(of: e.index)), "英数以外が出た: \(e.character)")
+        }
+    }
+
+    /// マスクしたロジットは区分外が -infinity で、区分内は元のまま
+    func testMaskLogitsReplacesOutsideWithNegativeInfinity() throws {
+        let classifier = try makeClassifier()
+        let raw = try classifier.logits(for: try sampleImage())
+        let masked = classifier.maskLogits(raw, categories: [.katakana])
+        let katakana = vocabulary.range(of: .katakana)
+        for i in 0 ..< raw.count {
+            if katakana.contains(i) {
+                XCTAssertEqual(masked[i], raw[i])
+            } else {
+                XCTAssertEqual(masked[i], -Float.infinity)
+            }
+        }
+        // 空集合はそのまま
+        XCTAssertEqual(classifier.maskLogits(raw, categories: []), raw)
+    }
+
     // MARK: - softmax 単体
 
     func testSoftmaxProperties() {

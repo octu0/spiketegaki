@@ -13,21 +13,29 @@
 
 <div id="shake" class="shake">
 
+  <!-- 観客・ストリーマー・硬貨などを描く 2 枚 (カードの下 / 上)。筆記領域の枠内は切り抜く -->
+  <canvas id="overlayBack" class="overlay overlay--back"></canvas>
+  <canvas id="overlayFront" class="overlay overlay--front"></canvas>
+
   <!-- タイトル -->
   <section id="screen-title" class="screen screen--on">
     <div class="title">
       <div id="titleMascot" class="mascot-slot mascot-slot--big"></div>
       <h1 class="sticker sticker--tilt">かきとりドリル</h1>
       <div class="card">
-        <p class="lead">よみを見て、かんじを 1 字 書こう。<br>小学 1 年の 80 字から 10 問。</p>
+        <p class="lead">よみを見て、かんじを 1 字 書こう。<br>1 もん 15 びょう、ミス 3 かいで おしまい。</p>
         <p id="boot" class="boot">よみこみ中…</p>
       </div>
-      <button id="startButton" class="big" type="button" disabled>はじめる</button>
+      <div class="startbuttons">
+        <button id="continueButton" class="big" type="button" disabled hidden>つづきから<small id="continueInfo" class="continue__info"></small></button>
+        <button id="startButton" class="big" type="button" disabled>はじめる</button>
+      </div>
 
       <dl class="records card">
         <div><dt>さいこう とくてん</dt><dd id="bestScore">0</dd></div>
         <div><dt>さいこう ドパ</dt><dd id="bestDopa">0</dd></div>
         <div><dt>さいこう コンボ</dt><dd id="bestCombo">0</dd></div>
+        <div><dt>さいこう ステージ</dt><dd id="bestStage">0</dd></div>
       </dl>
 
       <div class="settings card">
@@ -56,7 +64,8 @@
         <div class="hud__item card"><span class="hud__label">とくてん</span><span id="scoreValue" class="hud__value">0</span></div>
         <div class="hud__item card"><span class="hud__label">ドパ</span><span id="dopaValue" class="hud__value">0</span></div>
         <div class="hud__item card"><span class="hud__label">コンボ</span><span id="comboValue" class="hud__value">0</span></div>
-        <div class="hud__item card"><span class="hud__label" id="progressLabel">もんだい</span><span id="progressValue" class="hud__value">1 / 10</span></div>
+        <div class="hud__item card"><span class="hud__label" id="progressLabel">ステージ 1</span><span id="progressValue" class="hud__value">1 / 10</span></div>
+        <div class="hud__item card"><span class="hud__label">ライフ</span><span id="lives" class="hud__value lives"></span></div>
       </header>
       <div id="reach" class="reach">リーチ!</div>
     </div>
@@ -64,7 +73,10 @@
     <div class="meter"><div id="meterBar" class="meter__bar"></div></div>
     <div class="timer"><div id="timerBar" class="timer__bar"></div></div>
 
-    <!-- あつめた字: ラウンドの 10 枠を空カードで見せ、正解した字が飛んできて埋まる -->
+    <!-- 観客が並ぶ帯 (中身は空。観客は overlay の canvas に描く) -->
+    <div id="crowdBand" class="crowdband"></div>
+
+    <!-- あつめた字: ステージ 1 の 10 枠を空カードで見せ、正解した字が運ばれてきて埋まる (以後は伸びる) -->
     <div id="collected" class="collected"></div>
 
     <div class="question card">
@@ -85,6 +97,7 @@
           <div id="padFlash" class="flash"></div>
           <div id="padWipe" class="wipe"></div>
           <div id="hanamaru" class="hanamaru"></div>
+          <div id="answer" class="answer"><span class="answer__label">じかんぎれ! こたえは</span><span id="answerChar" class="answer__char"></span></div>
           <div id="verdict" class="verdict"></div>
         </div>
       </div>
@@ -92,30 +105,26 @@
 
     <div class="controls">
       <button id="clearButton" type="button">かきなおし</button>
-      <button id="passButton" type="button">パス</button>
+      <button id="passButton" type="button">パス <span id="passLeft" class="pass__left">3</span></button>
       <button id="quitButton" type="button" class="ghost">やめる</button>
     </div>
 
-    <!-- 観客: 色違いの小さなマスコット。正解で波のように跳ね、誤答で驚く -->
-    <div id="audience" class="fans"></div>
-  </section>
-
-  <!-- 結果 -->
-  <section id="screen-result" class="screen">
-    <div class="result">
-      <div id="resultMascot" class="mascot-slot mascot-slot--big"></div>
-      <h2 id="resultTitle" class="sticker sticker--tilt">けっか</h2>
+    <!-- ゲームオーバー (あつめた字の帯から下に重ねる。観客の帯は見えたまま、しょんぼり座る) -->
+    <div id="gameover" class="gameover card" hidden>
+      <div id="resultMascot" class="mascot-slot mascot-slot--mid"></div>
+      <h2 class="sticker sticker--tilt">ゲームオーバー</h2>
       <p class="result__score sticker"><span id="resultScore">0</span><span class="unit">てん</span></p>
-      <dl class="records card">
+      <dl class="records records--result">
         <div><dt>ドパ</dt><dd id="resultDopa">0</dd></div>
         <div><dt>さいだい コンボ</dt><dd id="resultCombo">0</dd></div>
-        <div><dt>せいかい</dt><dd id="resultCorrect">0</dd></div>
-        <div><dt>おしい</dt><dd id="resultClose">0</dd></div>
+        <div><dt>ステージ</dt><dd id="resultStage">1</dd></div>
       </dl>
+      <p class="gameover__label">あつめた字 <span id="resultCount">0</span></p>
+      <div id="resultChars" class="gameover__chars"></div>
       <p id="resultBest" class="result__best"></p>
       <div class="controls controls--result">
-        <button id="extraButton" class="big" type="button">エクストラへ (90 びょう)</button>
-        <button id="againButton" type="button">もう一回</button>
+        <button id="retryButton" class="big" type="button">リトライ</button>
+        <button id="restartButton" type="button">さいしょから</button>
         <button id="homeButton" type="button" class="ghost">おわる</button>
       </div>
     </div>
@@ -123,10 +132,12 @@
 
 </div>
 
-<div id="parade" class="parade"></div>
-<div id="flights" class="flights"></div>
 <div id="floats" class="floats"></div>
 <div id="banner" class="banner"></div>
+<div id="sash" class="sash"><span class="sash__text"></span></div>
+<div id="bignum" class="bignum"></div>
+<div id="countdown" class="countdown"></div>
+<div id="hurt" class="hurt"></div>
 
 <script type="module" src="js/main.js"></script>
 </body>

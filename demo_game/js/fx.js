@@ -11,25 +11,30 @@
 //   E < 0.4   紙吹雪・丸
 //   E < 0.75  + 星・ハート
 //   それ以上  + コイン・リボン・火花
+//
+// サンバーストの回転速度は毎フレーム spinTarget() (画面側が escalation.js の spinSpeed を渡す) を
+// 目標にして、目標が変わるたびに 300 ms でイージングする。prefers-reduced-motion では止める。
+// 画面の上に重なる飾り (観客・ストリーマー・硬貨など) は overlay.js が別の canvas に描く。
+
+import { MAX_PARTICLES, SPIN_BASE, easeSpin } from './escalation.js';
 
 const GRAVITY = 900;          // px/s^2
-const MAX_PARTICLES = 600;    // 上限 (これを越えたら古いものから捨てる)
 
-const CONFETTI = 'confetti';
+export const CONFETTI = 'confetti';
 const STAR = 'star';
 const CIRCLE = 'circle';
 const HEART = 'heart';
-const COIN = 'coin';
+export const COIN = 'coin';
 const RIBBON = 'ribbon';
 const SPARK = 'spark';
 const ROCKET = 'rocket';
 
 /** 濃紺の輪郭線 */
-const NAVY = '#2b2e5a';
+export const NAVY = '#2b2e5a';
 /** サンバーストと装飾のパステル (この順で繰り返す) */
-const PASTELS = ['#f7a8c4', '#f9d65c', '#7fb3f5', '#8fd8b5', '#c7a6f0', '#fff4e1'];
+export const PASTELS = ['#f7a8c4', '#f9d65c', '#7fb3f5', '#8fd8b5', '#c7a6f0', '#fff4e1'];
 /** 金色 (フィナーレ用) */
-const GOLD = ['#f9d65c', '#ffe9a3', '#e8b93c', '#fff4e1'];
+export const GOLD = ['#f9d65c', '#ffe9a3', '#e8b93c', '#fff4e1'];
 
 const STRIPES = 18;           // サンバーストのストライプ数
 const AMBIENT = 22;           // 常時漂う装飾の数
@@ -57,8 +62,15 @@ export class Effects {
     this.shake = 0;          // 残りの揺れの強さ (px)
     this.angle = 0;          // サンバーストの回転
     this.intensity = 0.3;    // 強度 E
-    this.spin = 1;           // 回転の倍率 (コンボで上がる)
+    this.spinTarget = () => SPIN_BASE;   // 回転速度 (rad/s) の目標。画面側が差し替える
+    this.speed = SPIN_BASE;  // 今の回転速度 (rad/s)
+    this.spinFrom = SPIN_BASE;
+    this.spinTo = SPIN_BASE;
+    this.spinChangedAt = 0;
     this.recoilMs = 0;       // 残りの「逆回転で弾む」時間
+    this.reducedMotion = typeof window.matchMedia === 'function'
+      ? window.matchMedia('(prefers-reduced-motion: reduce)')
+      : { matches: false };
     this.beatMs = 500;       // 1 拍の長さ (背景の脈動)
     this.beatPhase = 0;
     this.beat = 0;           // 数えた拍 (電飾の順送りに使う)
@@ -91,7 +103,7 @@ export class Effects {
     }
   }
 
-  /** 強度 E。背景の回転と脈動、粒子の量と種類に効く */
+  /** 強度 E。背景の脈動と、粒子の量と種類に効く */
   setIntensity(e) {
     this.intensity = Math.max(0, e);
   }
@@ -101,14 +113,18 @@ export class Effects {
     this.beatMs = Math.max(120, ms);
   }
 
-  /** サンバーストの回転倍率 (コンボで 1 倍 → 3 倍) */
-  setSpin(rate) {
-    this.spin = Math.max(0, rate);
+  /** 正解の瞬間に 1 拍だけ逆回転して弾む (回転を止める設定では弾まない) */
+  recoil() {
+    if (this.reducedMotion.matches) {
+      return;
+    }
+    this.recoilMs = this.beatMs;
+    this.start();
   }
 
-  /** 正解の瞬間に 1 拍だけ逆回転して弾む */
-  recoil() {
-    this.recoilMs = this.beatMs;
+  /** 画面を一瞬揺らす (ハートが割れたとき)。px は揺れの強さ */
+  jolt(px) {
+    this.shake = Math.max(this.shake, px);
     this.start();
   }
 
@@ -166,72 +182,6 @@ export class Effects {
     this.start();
   }
 
-  /** ドパの節目: 画面の上から硬貨が降る */
-  coinRain(count = 26) {
-    for (let i = 0; i < count; i += 1) {
-      this.push({
-        kind: COIN,
-        x: Math.random() * this.width,
-        y: -20 - Math.random() * this.height * 0.5,
-        vx: (Math.random() - 0.5) * 40,
-        vy: 120 + Math.random() * 140,
-        life: 0,
-        ttl: 1.6 + Math.random() * 0.8,
-        size: 12 + Math.random() * 9,
-        spin: 3 + Math.random() * 5,
-        rotation: Math.random() * Math.PI,
-        color: pick(GOLD),
-        palette: GOLD
-      });
-    }
-    this.start();
-  }
-
-  /** 完走: 左右の下からリボンを打ち上げる */
-  streamers(count = 18) {
-    for (let i = 0; i < count; i += 1) {
-      const fromLeft = i % 2 === 0;
-      this.push({
-        kind: RIBBON,
-        x: fromLeft ? -10 : this.width + 10,
-        y: this.height + 10,
-        vx: (fromLeft ? 1 : -1) * (180 + Math.random() * 200),
-        vy: -(620 + Math.random() * 220),
-        life: 0,
-        ttl: 1.6 + Math.random() * 0.6,
-        size: 14 + Math.random() * 12,
-        spin: (Math.random() - 0.5) * 6,
-        rotation: Math.random() * Math.PI,
-        color: pick(PASTELS),
-        palette: PASTELS
-      });
-    }
-    this.start();
-  }
-
-  /** パレードの尾。行進の足もとに紙吹雪をこぼす (画面は揺らさない) */
-  trail(origin, count = 5) {
-    for (let i = 0; i < count; i += 1) {
-      const a = -Math.PI / 2 + (Math.random() - 0.5) * Math.PI;
-      const speed = 60 + Math.random() * 120;
-      this.push({
-        kind: Math.random() < 0.7 ? CONFETTI : RIBBON,
-        x: origin.x + (Math.random() - 0.5) * 40,
-        y: origin.y,
-        vx: Math.cos(a) * speed,
-        vy: Math.sin(a) * speed,
-        life: 0,
-        ttl: 0.7 + Math.random() * 0.6,
-        size: 6 + Math.random() * 7,
-        spin: (Math.random() - 0.5) * 10,
-        rotation: Math.random() * Math.PI,
-        color: pick(PASTELS),
-        palette: PASTELS
-      });
-    }
-    this.start();
-  }
-
   /** 正解のたび、書いた墨の重心から小さな星が噴き出す */
   sparkle(origin, count = 12) {
     for (let i = 0; i < count; i += 1) {
@@ -255,9 +205,8 @@ export class Effects {
     this.start();
   }
 
-  /** 基本完走のフィナーレ。金色の粒子と花火を連発する */
+  /** ステージクリアのフィナーレ。金色の粒子と花火を連発する (ストリーマーは overlay 側) */
   finale() {
-    this.streamers();
     for (let i = 0; i < 6; i += 1) {
       window.setTimeout(() => this.celebrate(1.5, GOLD), i * 220);
       window.setTimeout(() => this.firework(GOLD), i * 220 + 110);
@@ -350,16 +299,27 @@ export class Effects {
       this.running = false;
       return;
     }
-    this.step(dt);
+    this.step(dt, time);
     this.drawBackdrop();
     this.draw();
     window.requestAnimationFrame((t) => this.frame(t));
   }
 
-  step(dt) {
-    const e = Math.min(1.5, this.intensity);
-    // 1 拍だけ逆回転して弾む (正解の瞬間)。それ以外はコンボの倍率ぶん速く回す
-    const speed = (0.02 + 0.07 * e) * this.spin;
+  /** 回転速度を目標へ寄せる。目標が変わったら、その時点の速度から 300 ms でイージングし直す */
+  updateSpin(time) {
+    const target = this.reducedMotion.matches ? 0 : Math.max(0, this.spinTarget());
+    if (target !== this.spinTo) {
+      this.spinFrom = this.speed;
+      this.spinTo = target;
+      this.spinChangedAt = time;
+    }
+    this.speed = easeSpin(this.spinFrom, this.spinTo, time - this.spinChangedAt);
+    return this.speed;
+  }
+
+  step(dt, time) {
+    // 1 拍だけ逆回転して弾む (正解の瞬間)。それ以外は目標の速度で回す
+    const speed = this.updateSpin(time);
     if (this.recoilMs > 0) {
       this.recoilMs -= dt * 1000;
       this.angle -= speed * 1.8 * dt;
@@ -517,7 +477,7 @@ export class Effects {
  * 輪郭線つきの図形を原点に描く。
  * phase は硬貨の「回って見える」つぶれ具合に使う (呼び出し側の回転角)。
  */
-function drawShape(ctx, kind, size, color, lineWidth, phase = 0) {
+export function drawShape(ctx, kind, size, color, lineWidth, phase = 0) {
   ctx.fillStyle = color;
   ctx.strokeStyle = NAVY;
   ctx.lineWidth = lineWidth;
@@ -639,4 +599,31 @@ export function flowerPath(petals = 8, outer = 44, inner = 30) {
   }
   parts.push('Z');
   return parts.join(' ');
+}
+
+/**
+ * 虹色の渦巻き (はなまるの虹版)。中心 (50, 50) から外へ巻くアルキメデスの渦を
+ * segments 本の短いパスに分けて返す (1 本ずつ色を変えて、順に筆を走らせる)。
+ * @param {number} turns 巻き数
+ * @param {number} segments 分割数
+ * @param {number} radius 外側の半径
+ */
+export function spiralPaths(turns = 3, segments = 7, radius = 42) {
+  const steps = 24;                     // 1 本あたりの折れ線の点数
+  const total = turns * Math.PI * 2;
+  const at = (a) => {
+    const r = 3 + (radius - 3) * (a / total);
+    return `${(50 + Math.cos(a - Math.PI / 2) * r).toFixed(2)} ${(50 + Math.sin(a - Math.PI / 2) * r).toFixed(2)}`;
+  };
+  const paths = [];
+  for (let i = 0; i < segments; i += 1) {
+    const a0 = (total * i) / segments;
+    const a1 = (total * (i + 1)) / segments;
+    const parts = [`M${at(a0)}`];
+    for (let k = 1; k <= steps; k += 1) {
+      parts.push(`L${at(a0 + ((a1 - a0) * k) / steps)}`);
+    }
+    paths.push(parts.join(' '));
+  }
+  return paths;
 }

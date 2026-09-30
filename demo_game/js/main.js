@@ -5,6 +5,8 @@
 //
 // 判定はすべて自動。ペンを離して 600 ms で認識し、正解なら確定する。一致しなければ
 // 書き続けられ、最後のペンアップから 1800 ms 書き足しが無ければ誤答を宣言する。
+// 1 問 15 秒。0 秒で墨があればその場で認識し、正解ならセーフ、それ以外は時間切れ。
+// 誤答の宣言と時間切れはミス (ライフ 3)。10 問で次のステージへ進む。
 
 import { boot, loadWeights, readInk, classify } from './recognizer.js';
 import {
@@ -12,37 +14,53 @@ import {
   TOP_K,
   CORRECT,
   CLOSE,
-  EXTRA_MS,
-  PHASE_EXTRA,
-  PHASE_DONE,
+  TIMEOUT,
+  LIVES,
+  TIME_LOW,
+  REVEAL_MS,
   JUDGE_AUTO,
   JUDGE_DECLARE,
   acceptAuto,
+  countdownNumber,
   judgeDelay,
-  nextJudge
+  nextJudge,
+  parseProgress,
+  timeRatio
 } from './game.js';
 import { blankedWord, BLANK } from './problems.js';
 import {
-  COMBO_LIMIT_MS,
-  COMBO_REPORT_MIN,
   DOPA_MAX,
   LIGHTS_FROM,
-  audienceCount,
-  baseTempo,
-  comboSpin,
-  extraTempo,
   formatBestDopa,
   formatDopa,
-  isComboReach
+  isComboReach,
+  score as scoreOf
 } from './scoring.js';
+import {
+  SPIN_BASE,
+  cheerLevel,
+  correctProps,
+  crowdCount,
+  floatLevel,
+  garlandCount,
+  leaperCount,
+  milestoneLabel,
+  sashText,
+  spinSpeed
+} from './escalation.js';
 import { Effects, starburstPoints } from './fx.js';
-import { Sound } from './audio.js';
+import { Sound, musicTempo } from './audio.js';
 import { Mascot } from './mascot.js';
 import { Crowd } from './crowd.js';
+import { Props } from './props.js';
+import { Overlay } from './overlay.js';
 import { Collected, Hanamaru, Lights, Wipe } from './stage.js';
 import {
   load as loadStore,
   save as saveStore,
+  loadProgress,
+  saveProgress,
+  clearProgress,
   recordBest,
   clampVolume,
   PEN_MIN,
@@ -57,19 +75,23 @@ const DOPA_ROLL_MS = 200;             // ドパのカウントアップの長さ
 const FOCUS_COMBO = 10;               // 集中線を出すコンボ数
 const MAX_COMBO = 20;                 // 虹色の縁取り・電飾の全点灯になるコンボ数
 const DANCE_EVERY = 5;                // マスコットがダンスするコンボの間隔
+const RAINBOW_COMBO = 5;              // はなまるが虹色の渦巻きになるコンボ数
 const VERDICT_GOOD_MS = 450;          // 正解の判定バースト (この間に次の問題が来る)
 const VERDICT_MISS_MS = 400;          // 誤答の判定バースト
 const HANAMARU_DELAY_MS = 190;        // 判定バーストが縮み始めてから はなまる を描く
 const CLAP_DELAY_MS = 430;            // はなまるを見てマスコットが拍手するまで
 const WHOOSH_DELAY_S = 0.16;          // 正解の効果音のあと「シュッ」を鳴らすまで (秒)
 const BLIP_MIN_GAP_MS = 140;          // 音量スライダーの確認音の最短間隔
+const FLOAT_STEP_PX = 30;             // 加点の浮遊を 1 段積むときの高さ
+const BIGNUM_CLEAR_MS = 600;          // 巨大数字がはずみ終わるまで、横断バナーは待つ (同じ高さに出るため)
+const HURT_JOLT_PX = 12;              // ハートが割れたときの画面の揺れ
+const HEART_BREAK_MS = 600;           // ハートが割れるアニメ (ゲームオーバーの画面はこのあとに出す)
 
 const el = (id) => document.getElementById(id);
 
 const screens = {
   title: el('screen-title'),
-  play: el('screen-play'),
-  result: el('screen-result')
+  play: el('screen-play')
 };
 
 const pad = el('pad');
@@ -78,6 +100,8 @@ const hintCtx = el('hintPad').getContext('2d');
 const padwrap = el('padwrap');
 const verdictBox = el('verdict');
 const timerBar = el('timerBar');
+const countdownBox = el('countdown');
+const gameoverBox = el('gameover');
 
 const effects = new Effects(el('bg'), el('fx'), el('shake'));
 const sound = new Sound();
@@ -86,11 +110,24 @@ const mascots = {
   play: new Mascot(el('playMascot')),
   result: new Mascot(el('resultMascot'))
 };
-const crowd = new Crowd(el('audience'), el('parade'), (x, y) => effects.trail({ x, y }));
+const props = new Props();
+const crowd = new Crowd({
+  onConfetti: (x, y, n) => props.confetti(x, y, n),
+  onFirework: () => effects.firework()
+});
+// 観客と飾りの canvas (カードの下と上の 2 枚)。帯と筆記領域の位置を測って、枠内を切り抜いて描く
+const overlay = new Overlay(el('overlayBack'), el('overlayFront'), {
+  crowd,
+  props,
+  anchors: () => ({
+    pad: screens.play.classList.contains('screen--on') ? padwrap : null,
+    band: el('crowdBand')
+  })
+});
 const lights = new Lights(el('lights'));
 const hanamaru = new Hanamaru(el('hanamaru'));
 const wipe = new Wipe(el('padWipe'));
-const collected = new Collected(el('collected'), el('flights'));
+const collected = new Collected(el('collected'));
 const reachTag = el('reach');
 
 const settings = loadStore();
@@ -109,11 +146,38 @@ let lastUpAt = 0;
 let displayDopa = 0;
 let dopaRoll = null;
 
-// 書いた墨の重心 (星を噴き出す位置)。筆記領域の座標で足しこむ
+// 書いた墨の重心 (星を噴き出す位置)。筆記領域の座標で足しこむ。n > 0 なら墨がある
 let ink = { x: 0, y: 0, n: 0 };
 let reaching = false;
 let clapTimer = 0;
 let hanamaruTimer = 0;
+
+// カウントダウン中の数字 (5〜1、出していなければ null)
+let counting = null;
+// 時間切れで正解の字を見せている間のタイマー / ゲームオーバーの画面を出すまでのタイマー
+let revealTimer = 0;
+let gameoverTimer = 0;
+
+// 最後の誤答 (おしい / もういちど / 時間切れ) の時刻。次の正解で null に戻す (背景の回転が止まる → ゆっくり)
+let missAt = null;
+// 加点の浮遊を積む段と、最後に浮かべた時刻
+let floatStack = { level: 0, at: -Infinity };
+// 最後に巨大数字を出した時刻 (横断バナーと重ならないようにずらす)
+let bignumAt = -Infinity;
+
+// 背景の回転速度は、問題の進行・コンボ・誤答のあとかどうかで毎フレーム決める
+effects.spinTarget = () => {
+  if (game === null) {
+    return SPIN_BASE;
+  }
+  return spinSpeed({
+    index: game.index,
+    total: game.questionCount,
+    later: game.stage > 1,
+    combo: game.combo,
+    sinceMissMs: missAt === null ? null : performance.now() - missAt
+  });
+};
 
 padCtx.lineCap = 'round';
 padCtx.lineJoin = 'round';
@@ -153,6 +217,7 @@ function show(name) {
   for (const [key, node] of Object.entries(screens)) {
     node.classList.toggle('screen--on', key === name);
   }
+  overlay.measure();
 }
 
 // MARK: - 起動
@@ -165,6 +230,7 @@ async function start() {
     el('boot').textContent = `よういできました (${(bytes / 1048576).toFixed(1)} MiB)`;
     ready = true;
     el('startButton').disabled = false;
+    el('continueButton').disabled = false;
   } catch (error) {
     el('boot').textContent = `よみこめませんでした: ${error.message}`;
     console.error(error);
@@ -177,6 +243,20 @@ function showRecords() {
   el('bestScore').textContent = String(settings.bestScore);
   el('bestDopa').textContent = formatBestDopa(settings.bestDopa);
   el('bestCombo').textContent = String(settings.bestCombo);
+  el('bestStage').textContent = String(settings.bestStage);
+  showContinue();
+}
+
+/** 途中の状態が保存してあれば「つづきから」を出す (ゲームオーバー後も残る = リトライと同じ位置) */
+function showContinue() {
+  const saved = parseProgress(loadProgress());
+  el('continueButton').hidden = saved === null;
+  el('startButton').textContent = saved === null ? 'はじめる' : 'さいしょから';
+  el('startButton').classList.toggle('big', saved === null);
+  if (saved !== null) {
+    const score = scoreOf(saved.firstStageSolved, saved.laterSolved);
+    el('continueInfo').textContent = `ステージ ${saved.stage}・${saved.index + 1} もんめ (${score}てん)`;
+  }
 }
 
 el('soundToggle').checked = settings.sound;
@@ -207,7 +287,7 @@ el('volumeInput').addEventListener('input', () => {
   const now = performance.now();
   if (now - blipAt >= BLIP_MIN_GAP_MS) {
     blipAt = now;
-    sound.blip();
+    sound.cue('blip');
   }
 });
 
@@ -225,23 +305,47 @@ el('startButton').addEventListener('click', () => {
   if (!ready) {
     return;
   }
+  clearProgress();
+  begin(null);
+});
+
+el('continueButton').addEventListener('click', () => {
+  if (!ready) {
+    return;
+  }
+  begin(parseProgress(loadProgress()));
+});
+
+/** 音を始めてからゲームを始める */
+function begin(saved) {
   // 音はブラウザの制約で、最初のユーザー操作のときにしか始められない。
   // ただし resume() が解決しないことがあるので待たない (音が出なくてもゲームは始める)
   sound.ensureStarted();
   sound.setEnabled(settings.sound);
   sound.setVolume(settings.volume);
   sound.startMusic();
-  newGame();
-});
+  newGame(saved);
+}
 
-// MARK: - ラウンド
+// MARK: - ステージ
 
-function newGame() {
-  game = new Game();
-  displayDopa = 0;
+/** 新しいゲーム。saved (parseProgress の結果) があれば、その位置から続ける */
+function newGame(saved = null) {
+  game = new Game({ saved });
+  displayDopa = game.dopa;
   dopaRoll = null;
+  missAt = null;
+  hideGameover();
   clearPad();
-  collected.reset();
+  if (saved === null) {
+    collected.reset();
+  } else {
+    // 画像は保存していないので、あつめた字は活字で並べ直す
+    collected.restore(game.collected);
+  }
+  crowd.reset();
+  props.clear();
+  resetHearts();
   show('play');
   renderQuestion();
   updateHud();
@@ -268,6 +372,34 @@ function renderQuestion() {
   drawHint(false);
   applyIntensity();
   slideInQuestion();
+  overlay.measure();
+  const sash = sashText({ stage: game.stage, index: game.index, total: game.questionCount });
+  if (sash !== null) {
+    showSash(sash);
+  }
+  if (game.index === game.questionCount - 1) {
+    sound.cue('lastProblem');
+  }
+  updateCountdown(null);
+  syncSound();
+  persist();
+}
+
+/** 曲に今の進行を伝える (問題の開始と判定のたび)。曲はここからセクションとレイヤーを選ぶ */
+function syncSound() {
+  sound.setProgress({
+    stage: game.stage,
+    index: game.index,
+    total: game.questionCount,
+    combo: game.combo,
+    lives: game.lives,
+    intensity: game.intensity()
+  });
+}
+
+/** つづきから用に今の状態を保存する */
+function persist() {
+  saveProgress(game.snapshot());
 }
 
 /** 次の問題が左からすべり込む (200 ms)。判定バーストが消えるより先に読める */
@@ -281,13 +413,10 @@ function slideInQuestion() {
 function updateHud() {
   setValue('scoreValue', String(game.score()));
   updateCombo();
-  if (game.phase === PHASE_EXTRA) {
-    el('progressLabel').textContent = 'のこり びょう';
-    el('progressValue').textContent = String(Math.ceil(game.extraRemainingMs() / 1000));
-  } else {
-    el('progressLabel').textContent = 'もんだい';
-    el('progressValue').textContent = `${Math.min(game.index + 1, game.questionCount)} / ${game.questionCount}`;
-  }
+  el('progressLabel').textContent = `ステージ ${game.stage}`;
+  el('progressValue').textContent = `${game.index + 1} / ${game.questionCount}`;
+  el('passLeft').textContent = String(game.passesLeft());
+  el('passButton').disabled = !game.playing() || game.passesLeft() === 0;
 }
 
 function setValue(id, text) {
@@ -315,8 +444,7 @@ function updateCombo() {
   node.classList.toggle('hud__value--hot2', game.combo >= FOCUS_COMBO && game.combo < MAX_COMBO);
   node.classList.toggle('hud__value--hot3', game.combo >= MAX_COMBO);
   padwrap.classList.toggle('padwrap--max', game.combo >= MAX_COMBO);
-  // 背景はコンボが伸びるほど速く回り、MAX で電飾が虹色に全点灯する
-  effects.setSpin(comboSpin(game.combo));
+  // MAX で電飾が虹色に全点灯する (背景の回転は effects.spinTarget が毎フレーム読む)
   lights.setRainbow(game.combo >= MAX_COMBO);
   updateReach();
   if (game.combo >= FOCUS_COMBO) {
@@ -355,24 +483,18 @@ function tickDopa(now) {
   updateDopa();
 }
 
-/** 強度 E を背景・BGM のテンポとレイヤー・拍の脈動に反映する */
+/**
+ * 強度 E と正解数を、背景の脈動・観客の人数・飾りの量に反映する (曲には syncSound で伝える)。
+ * 背景の脈動と電飾は曲と同じテンポで打つ
+ */
 function applyIntensity() {
   const e = game.intensity();
   effects.setIntensity(e);
-  let bpm;
-  let transpose;
-  if (game.phase === PHASE_EXTRA) {
-    const tier = game.tier();
-    bpm = extraTempo(tier);
-    transpose = 2 + Math.min(tier, 5);
-  } else {
-    bpm = baseTempo(e);
-    // 最終問だけ 2 半音上げる
-    transpose = game.index === game.questionCount - 1 ? 2 : 0;
-  }
-  sound.setTempo(bpm, transpose, e);
-  effects.setBeat(60000 / bpm);
-  crowd.setCount(audienceCount(e));
+  effects.setBeat(60000 / musicTempo(game.stage, e));
+  crowd.setCount(crowdCount(game.correctCount, e));
+  crowd.setIntensity(e);
+  props.setIntensity(e);
+  props.setGarlands(garlandCount(game.correctCount));
   lights.setOn(e >= LIGHTS_FROM);
 }
 
@@ -384,7 +506,7 @@ function updateReach() {
   }
   reaching = on;
   reachTag.classList.toggle('reach--on', on);
-  crowd.setLean(on);
+  crowd.setLean(reaching || counting !== null);
   if (on) {
     mascots.play.lean();
   }
@@ -401,7 +523,7 @@ function pointOf(event) {
 }
 
 pad.addEventListener('pointerdown', (event) => {
-  if (game === null || game.phase === PHASE_DONE) {
+  if (game === null || !game.playing()) {
     return;
   }
   event.preventDefault();
@@ -467,7 +589,7 @@ function inkOrigin(rect) {
   };
 }
 
-/** 書いた字を写す (「あつめた字」の帯へ飛ばすため)。消す前に呼ぶ */
+/** 書いた字を写す (「あつめた字」の帯に並べるため)。消す前に呼ぶ */
 function snapshotPad() {
   try {
     return pad.toDataURL('image/png');
@@ -475,6 +597,15 @@ function snapshotPad() {
     console.error(error);
     return null;
   }
+}
+
+/** 書いた字を canvas に写す (観客が帯まで運ぶ間に描くため)。消す前に呼ぶ */
+function copyPad() {
+  const copy = document.createElement('canvas');
+  copy.width = PAD;
+  copy.height = PAD;
+  copy.getContext('2d').drawImage(pad, 0, 0);
+  return copy;
 }
 
 function clearPad() {
@@ -567,13 +698,10 @@ function runJudge() {
  * (点 1 つなど、墨が足りない) では何もしない。
  */
 function recognize(declare) {
-  if (game === null || game.phase === PHASE_DONE) {
+  if (game === null || !game.playing()) {
     return;
   }
   const problem = game.current();
-  if (problem === null) {
-    return;
-  }
   const result = classifyPad();
   if (result === null || !result.ok) {
     return;
@@ -584,54 +712,77 @@ function recognize(declare) {
   handle(game.answer(result.rows));
 }
 
+/**
+ * 0 秒になった。書いている途中の画もそこまでの墨で認識し、正解ならセーフ、それ以外は時間切れ。
+ * 墨が無い・薄墨ガードに掛かるときは認識せずに時間切れ。
+ */
+function timeUp() {
+  cancelJudge();
+  drawing = false;
+  const result = ink.n > 0 ? classifyPad() : null;
+  handle(game.timeUp(result !== null && result.ok ? result.rows : null));
+}
+
 function handle(outcome) {
   if (outcome.ignored) {
-    // 判定が来たときに 90 秒を過ぎていた。ループより先にここで終わりに気づくことがある
-    if (outcome.extraExpired) {
-      finishExtra();
-    }
     return;
   }
   if (outcome.verdict === CORRECT) {
     onCorrect(outcome);
+  } else if (outcome.verdict === TIMEOUT) {
+    onTimeout(outcome);
   } else {
     onMiss(outcome);
   }
   updateHud();
+  syncSound();
+  persist();
 }
 
 function onCorrect(outcome) {
   const e = outcome.intensity;
   const padRect = padwrap.getBoundingClientRect();
-  // 書いた字は消す前に写して、そのまま「あつめた字」の帯へ飛ばす
+  // 書いた字は消す前に写して、観客が「あつめた字」の帯へ運ぶ
   const written = snapshotPad();
+  const inkCopy = copyPad();
   const origin = inkOrigin(padRect);
+  const milestone = outcome.milestones.length > 0;
+  missAt = null;
 
-  flashVerdict('せいかい!', 'good', VERDICT_GOOD_MS);
+  flashVerdict(outcome.safe ? 'セーフ!' : 'せいかい!', 'good', VERDICT_GOOD_MS);
   flashPad();
   effects.burst(e, padOrigin());
   effects.sparkle(origin);
   effects.recoil();
-  sound.correct(e, outcome.combo);
+  // 0 秒ぎりぎりの正解は「セーフ!」の音
+  if (outcome.safe) {
+    sound.cue('safe');
+  } else {
+    sound.cue('correct', { combo: outcome.combo });
+  }
   // 正解の音のすぐ後ろで「シュッ」。次の問題が来る合図
-  sound.whoosh(WHOOSH_DELAY_S);
-  mascots.play.correct(e, outcome.comboCelebration || outcome.milestones.length > 0);
-  crowd.wave();
-  floatText(`+${outcome.gained}`, '');
-  floatText(`ドパ +${dopaDelta(outcome.dopaBefore, outcome.dopaAfter)}`, 'dopa');
+  sound.cue('whoosh', { delay: WHOOSH_DELAY_S });
+  mascots.play.correct(e, outcome.comboCelebration || milestone);
+  // 観客: 正解数で喜び方が上がる。高い E では画面を飛び越え、飾りも E に応じて噴き出す
+  crowd.cheer(cheerLevel(game.correctCount));
+  crowd.leap(leaperCount(e), overlay.layout);
+  props.burst(correctProps(e, milestone), overlay.layout);
+  floatScore(`+${outcome.gained}`, `ドパ +${dopaDelta(outcome.dopaBefore, outcome.dopaAfter)}`);
   rollDopa(displayDopa, outcome.dopaAfter);
-  // 正解では字が「あつめた字」の帯へ飛んでいくので、ワイプは帯だけ走らせる
+  // 正解では字を観客が運んでいくので、ワイプは帯だけ走らせる
   wipePad(null);
   drawHint(false);
-  // 「せいかい!」のバーストが縮み始めたところで はなまる を描く (ふたつが重ならない)
+  // 「せいかい!」のバーストが縮み始めたところで はなまる を描く (ふたつが重ならない)。
+  // コンボが乗っていれば虹色の渦巻き
+  const rainbow = outcome.combo >= RAINBOW_COMBO;
   window.clearTimeout(hanamaruTimer);
-  hanamaruTimer = window.setTimeout(() => hanamaru.play(), HANAMARU_DELAY_MS);
+  hanamaruTimer = window.setTimeout(() => hanamaru.play(rainbow), HANAMARU_DELAY_MS);
   if (written !== null) {
-    collected.collect(written, padRect);
+    carryWritten(inkCopy, written, padRect, origin);
   }
 
   // 祝いの一言。次の問題を出すとお知らせ欄が消えるので、文面だけ先に決めておく
-  let notice = '';
+  let notice = outcome.safe ? 'ぎりぎり セーフ!' : '';
   const big = outcome.comboCelebration || outcome.milestones.length > 0;
   if (outcome.combo > 0 && outcome.combo % DANCE_EVERY === 0) {
     mascots.play.dance();
@@ -639,32 +790,46 @@ function onCorrect(outcome) {
   if (outcome.comboCelebration) {
     notice = `${outcome.combo} コンボ!`;
     effects.celebrate(e);
-    sound.comboFanfare();
+    sound.cue('comboMilestone', { combo: outcome.combo });
     showBanner(`${outcome.combo} コンボ!`);
     crowd.jump();
   }
-  if (outcome.milestones.length > 0) {
+  if (milestone) {
     const reached = outcome.milestones[outcome.milestones.length - 1];
     notice = `ドパ ${formatDopa(game.dopa)} とうたつ!`;
     effects.celebrate(Math.max(1.2, e));
-    effects.coinRain();
-    sound.milestone();
-    showBanner(`${formatDopa(reached)} ドパ とうたつ!`);
+    sound.cue('dopaMilestone', { level: reached });
+    // ドパの節目は黄色の巨大な数字がはずんで出る (硬貨の雨は props.burst が降らせる)
+    showBigNumber(milestoneLabel(reached));
     mascots.play.spin();
     crowd.jump();
   }
   // 大きな節目は観客が画面の下を行進する
-  if (outcome.milestones.length > 0 || (outcome.comboCelebration && outcome.combo >= MAX_COMBO)) {
+  if (milestone || (outcome.comboCelebration && outcome.combo >= MAX_COMBO)) {
     crowd.parade();
   }
   scheduleClap(big);
 
-  if (outcome.baseFinished) {
-    finishBase();
-    return;
+  nextQuestion(outcome);
+  if (notice !== '') {
+    el('questionHint').textContent = notice;
+  }
+}
+
+/**
+ * 次の問題を出す。ステージの最終問を終えていれば (正解・パス・時間切れのどれでも)、
+ * そのステージに正解があれば完走のフィナーレで祝い、次のステージの 1 問目で「ステージ n」の横断バナー。
+ * @param {{stageCleared: number, clearedCorrect: number}} step Game#advance() の結果
+ */
+function nextQuestion(step) {
+  if (step.stageCleared > 0 && step.clearedCorrect > 0) {
+    effects.finale();
+    sound.cue('stageClear', { stage: step.stageCleared });
+    mascots.play.giant();
+    crowd.parade();
+    props.finale(overlay.layout);
   }
   renderQuestion();
-  el('questionHint').textContent = notice;
 }
 
 /** はなまるが描き上がったころにマスコットが拍手する (もっと大きな反応があるときは譲る) */
@@ -676,27 +841,142 @@ function scheduleClap(big) {
   clapTimer = window.setTimeout(() => mascots.play.clap(), CLAP_DELAY_MS);
 }
 
+/** 書いた字を観客の腕が掴んで「あつめた字」の空き枠へ運ぶ */
+function carryWritten(inkCopy, dataUrl, padRect, origin) {
+  const slot = collected.reserve();
+  crowd.carry({
+    ink: inkCopy,
+    from: overlay.toLocal(padRect),
+    grab: overlay.toLocal({ x: origin.x, y: origin.y, width: 0, height: 0 }),
+    to: overlay.toLocal(slot.getBoundingClientRect()),
+    onLand: () => collected.land(slot, dataUrl)
+  });
+}
+
+/** 誤答の宣言 (おしい / もういちど) = ミス 1。同じ問題を続ける (残り時間はそのまま) */
 function onMiss(outcome) {
   const close = outcome.verdict === CLOSE;
+  missAt = performance.now();
   flashVerdict(close ? 'おしい!' : 'もういちど', close ? 'close' : 'bad', VERDICT_MISS_MS);
   if (close) {
-    sound.close();
+    sound.cue('close');
     mascots.play.close();
   } else {
-    sound.wrong();
+    sound.cue('wrong');
     mascots.play.wrong();
   }
-  crowd.startle();
-  window.clearTimeout(clapTimer);
-  window.clearTimeout(hanamaruTimer);
+  loseHeart(outcome);
   // 待ち時間を作らないよう、筆記領域はすぐ消す (判定の表示だけが 400 ms 残る)
   wipePad();
+  if (outcome.gameOver) {
+    scheduleGameover(HEART_BREAK_MS);
+    return;
+  }
   if (outcome.showsHint) {
     el('questionHint').textContent = 'うすい おてほんを なぞってみよう';
     drawHint(true);
   } else if (outcome.brokenCombo > 0) {
     el('questionHint').textContent = `${outcome.brokenCombo} コンボ しゅうりょう`;
   }
+}
+
+/**
+ * 時間切れ = ミス 1。正解の字を 800 ms 見せてから次の問題へ (書き取りの学習になる)。
+ * ライフが尽きたら、見せ終えてからゲームオーバーの画面を出す。
+ */
+function onTimeout(outcome) {
+  missAt = performance.now();
+  sound.cue('timeout');
+  mascots.play.wrong();
+  loseHeart(outcome);
+  wipePad();
+  drawHint(false);
+  updateCountdown(null);
+  showAnswer(outcome.problem.kanji);
+  el('questionHint').textContent = outcome.brokenCombo > 0
+    ? `${outcome.brokenCombo} コンボ しゅうりょう`
+    : '';
+  if (outcome.gameOver) {
+    scheduleGameover(REVEAL_MS);
+    return;
+  }
+  window.clearTimeout(revealTimer);
+  revealTimer = window.setTimeout(() => {
+    hideAnswer();
+    if (game === null) {
+      return;
+    }
+    const step = game.finishReveal();
+    if (step !== null) {
+      nextQuestion(step);
+      updateHud();
+    }
+  }, REVEAL_MS);
+}
+
+/** 筆記領域に「じかんぎれ! こたえは 林」を出す */
+function showAnswer(kanji) {
+  el('answerChar').textContent = kanji;
+  const node = el('answer');
+  node.classList.remove('answer--on');
+  void node.offsetWidth;
+  node.classList.add('answer--on');
+}
+
+function hideAnswer() {
+  el('answer').classList.remove('answer--on');
+}
+
+// MARK: - ライフ
+
+/** HUD のハートを 3 つ満タンに並べ直す */
+function resetHearts() {
+  const host = el('lives');
+  host.replaceChildren();
+  for (let i = 0; i < game.lives; i += 1) {
+    host.append(makeHeart());
+  }
+  for (let i = game.lives; i < LIVES; i += 1) {
+    const heart = makeHeart();
+    heart.classList.add('heart--lost');
+    host.append(heart);
+  }
+}
+
+/** ハート。ふだんは 1 枚で描き、割れるときだけ左右の半分 (ぎざぎざの割れ目) に差し替える */
+function makeHeart() {
+  const node = document.createElement('span');
+  node.className = 'heart';
+  node.innerHTML =
+    '<svg viewBox="0 0 24 22" aria-hidden="true">'
+    + '<path class="heart__whole" d="M12 21 C5 16 1 12 1 7 C1 3.5 3.6 1 6.6 1 C9 1 11 2.4 12 4.4 C13 2.4 15 1 17.4 1 C20.4 1 23 3.5 23 7 C23 12 19 16 12 21 Z"/>'
+    + '<path class="heart__half heart__half--l" d="M12 21 C5 16 1 12 1 7 C1 3.5 3.6 1 6.6 1 C9 1 11 2.4 12 4.4 L10.4 8 L12.6 11 L11 14.5 Z"/>'
+    + '<path class="heart__half heart__half--r" d="M12 21 C19 16 23 12 23 7 C23 3.5 20.4 1 17.4 1 C15 1 13 2.4 12 4.4 L10.4 8 L12.6 11 L11 14.5 Z"/>'
+    + '</svg>';
+  return node;
+}
+
+/**
+ * ミス 1: ハートが割れ、画面が一瞬赤く揺れる。観客は驚き、背景の回転は止まる (missAt)。
+ * @param {{lives: number}} outcome ミスのあとのライフ
+ */
+function loseHeart(outcome) {
+  const hearts = el('lives').children;
+  const heart = hearts[outcome.lives];
+  if (heart) {
+    heart.classList.remove('heart--refill');
+    heart.classList.add('heart--break');
+    window.setTimeout(() => heart.classList.add('heart--lost'), HEART_BREAK_MS);
+  }
+  sound.cue('lifeLost', { lives: outcome.lives });
+  crowd.startle();
+  window.clearTimeout(clapTimer);
+  window.clearTimeout(hanamaruTimer);
+  effects.jolt(HURT_JOLT_PX);
+  const hurt = el('hurt');
+  hurt.classList.remove('hurt--on');
+  void hurt.offsetWidth;
+  hurt.classList.add('hurt--on');
 }
 
 // MARK: - 演出の小道具
@@ -723,17 +1003,29 @@ function padOrigin() {
   return { x: rect.x + rect.width / 2, y: rect.y + rect.height * 0.5 };
 }
 
-/** 筆記領域から上へ浮いて消える文字 */
-function floatText(text, kind) {
+/**
+ * 加点とドパの増分を浮かべる。続けて正解して前の浮遊がまだ見えているうちは 1 段上に積む
+ * (連続正解が「積み上がって」見える)。
+ */
+function floatScore(scoreText, dopaText) {
+  const now = performance.now();
+  const level = floatLevel(floatStack.level, now - floatStack.at);
+  floatStack = { level, at: now };
+  floatText(scoreText, '', level);
+  floatText(dopaText, 'dopa', level);
+}
+
+/** 筆記領域から上へ浮いて消える文字。level 段ぶん上にずらす */
+function floatText(text, kind, level) {
   const rect = padwrap.getBoundingClientRect();
   const node = document.createElement('div');
   node.className = kind ? `float float--${kind}` : 'float';
   node.textContent = text;
   // 判定表示 (中央のバースト) に重ならないよう、得点は上、ドパは下へ寄せる
   const dopa = kind === 'dopa';
-  const offset = (dopa ? 0.22 : -0.24) + (Math.random() - 0.5) * 0.1;
+  const offset = (dopa ? 0.22 : -0.2) + (Math.random() - 0.5) * 0.1;
   node.style.left = `${rect.x + rect.width / 2 + rect.width * offset}px`;
-  node.style.top = `${rect.y + rect.height * (dopa ? 0.82 : 0.18)}px`;
+  node.style.top = `${rect.y + rect.height * (dopa ? 0.82 : 0.2) - level * FLOAT_STEP_PX}px`;
   el('floats').append(node);
   node.addEventListener('animationend', () => node.remove());
 }
@@ -753,18 +1045,54 @@ function showBanner(text) {
   node.classList.add('banner--show');
 }
 
+/**
+ * 横断バナーと巨大数字を置く高さ (画面の座標)。プレイ中は HUD と筆記領域の間
+ * (問題文のあたり)、それ以外は画面の上から 24%。
+ */
+function upperBandY() {
+  if (!screens.play.classList.contains('screen--on')) {
+    return window.innerHeight * 0.24;
+  }
+  const hud = document.querySelector('.hudwrap').getBoundingClientRect();
+  const top = padwrap.getBoundingClientRect().top;
+  return (hud.bottom + top) / 2;
+}
+
+/** 濃紺の斜めストライプの帯に巨大な白文字 (ラスト1もん / 100てん! / EX n) が左から右へ横切る */
+function showSash(text) {
+  const node = el('sash');
+  node.querySelector('.sash__text').textContent = text;
+  node.style.setProperty('--sash-y', `${upperBandY()}px`);
+  // 同じ正解でドパの節目の数字も出ていれば、はずみ終わってから横切らせる
+  const wait = Math.max(0, bignumAt + BIGNUM_CLEAR_MS - performance.now());
+  node.style.animationDelay = `${Math.round(wait)}ms`;
+  node.classList.remove('sash--show');
+  void node.offsetWidth;
+  node.classList.add('sash--show');
+}
+
+/** ドパの節目: 黄色の巨大ステッカー数字 (1万 / 10万 …) がはずんで出る */
+function showBigNumber(text) {
+  const node = el('bignum');
+  node.textContent = text;
+  node.style.setProperty('--bignum-y', `${upperBandY()}px`);
+  bignumAt = performance.now();
+  node.classList.remove('bignum--show');
+  void node.offsetWidth;
+  node.classList.add('bignum--show');
+}
+
 el('passButton').addEventListener('click', () => {
-  if (game === null || game.phase === PHASE_DONE) {
+  if (game === null) {
     return;
   }
   const outcome = game.pass();
-  wipePad();
-  drawHint(false);
-  if (outcome.baseFinished) {
-    finishBase();
+  if (!outcome.passed) {
     return;
   }
-  renderQuestion();
+  wipePad();
+  drawHint(false);
+  nextQuestion(outcome);
   el('questionHint').textContent = outcome.brokenCombo > 0
     ? `${outcome.brokenCombo} コンボ しゅうりょう`
     : '';
@@ -772,25 +1100,38 @@ el('passButton').addEventListener('click', () => {
 });
 
 el('quitButton').addEventListener('click', () => {
-  if (game === null || !window.confirm('やめますか? ここまでの きろくは のこります')) {
+  if (game === null || !window.confirm('やめますか? つづきから あそべます')) {
     return;
   }
-  window.cancelAnimationFrame(frame);
-  cancelJudge();
   recordBest(settings, game.summary());
-  game = null;
-  sound.stopMusic();
-  quietStage();
-  showRecords();
-  show('title');
+  goTitle();
 });
 
-/** プレイ画面を離れるときに、動いているものをぜんぶ静める */
+/** タイトルへ戻る。途中の状態は保存したまま (つづきから) */
+function goTitle() {
+  window.cancelAnimationFrame(frame);
+  cancelJudge();
+  game = null;
+  sound.stopMusic();
+  hideGameover();
+  quietStage();
+  props.clear();
+  showRecords();
+  show('title');
+}
+
+/** プレイ画面を離れるときに、動いているものをぜんぶ静める (常時わき出る飾りも止める) */
 function quietStage() {
   window.clearTimeout(clapTimer);
   window.clearTimeout(hanamaruTimer);
+  window.clearTimeout(revealTimer);
+  window.clearTimeout(gameoverTimer);
+  hideAnswer();
+  updateCountdown(null);
+  missAt = null;
   effects.setFocus(null, 0);
-  effects.setSpin(1);
+  props.setIntensity(0);
+  props.setGarlands(0);
   lights.setOn(false);
   lights.setRainbow(false);
   crowd.stop();
@@ -799,87 +1140,118 @@ function quietStage() {
   padwrap.classList.remove('padwrap--max');
 }
 
-// MARK: - ループ (残り時間と時間切れ)
+// MARK: - ループ (残り時間・カウントダウン・時間切れ)
 
 function loop() {
   window.cancelAnimationFrame(frame);
   const step = (now) => {
-    if (game === null || game.phase === PHASE_DONE) {
+    if (game === null) {
       return;
     }
     tickDopa(now);
-    const events = game.tick();
-    if (events.comboExpired) {
-      el('questionHint').textContent = events.brokenCombo >= COMBO_REPORT_MIN
-        ? `${events.brokenCombo} コンボ しゅうりょう`
-        : '';
-      updateHud();
+    if (game.tick().timeUp) {
+      timeUp();
     }
-    if (events.extraExpired) {
-      finishExtra();
-      return;
-    }
-    updateTimerBar();
-    if (game.phase === PHASE_EXTRA) {
-      updateHud();
+    if (game !== null) {
+      updateTimer();
     }
     frame = window.requestAnimationFrame(step);
   };
   frame = window.requestAnimationFrame(step);
 }
 
-function updateTimerBar() {
-  // コンボの残り時間。1 コンボ以下は時間切れの対象外なので満タンのまま
-  const remaining = game.comboRemainingMs();
-  const ratio = remaining === Infinity ? 1 : Math.min(1, remaining / COMBO_LIMIT_MS);
+/** 残り時間のバー (30% 未満で赤く脈動) と、残り 5 秒からの巨大なカウントダウン */
+function updateTimer() {
+  const remaining = game.playing() ? game.remainingMs() : Infinity;
+  // 時間切れで字を見せている間とゲームオーバーでは空のまま
+  const ratio = game.playing() ? timeRatio(remaining) : 0;
   timerBar.style.transform = `scaleX(${ratio.toFixed(3)})`;
-  timerBar.classList.toggle('timer__bar--low', ratio < 0.3);
+  timerBar.classList.toggle('timer__bar--low', ratio < TIME_LOW);
+  updateCountdown(countdownNumber(remaining));
 }
 
-// MARK: - 結果
-
-function finishBase() {
-  // 1 問も正解していない (ぜんぶパスした) ときは、祝わずに静かに結果へ。
-  // エクストラへは正解数に関係なく進める
-  if (game.correctCount === 0) {
-    showResult('けっか', true, false);
+/**
+ * カウントダウンの数字を出し替える (数字が変わったときだけ)。null で消す。
+ * 出している間は観客とマスコットが筆記領域の方へ身を乗り出す (固唾をのむ)。
+ */
+function updateCountdown(n) {
+  if (n === counting) {
     return;
   }
-  effects.finale();
-  sound.finale();
-  mascots.result.giant();
-  showResult('かんそう!', true, true);
-  // パレードは結果の上を横切らせる (quietStage で止まらないよう、画面を切り替えた後に出す)
-  crowd.parade();
+  const started = counting === null && n !== null;
+  counting = n;
+  crowd.setLean(reaching || counting !== null);
+  if (n === null) {
+    countdownBox.classList.remove('countdown--show');
+    return;
+  }
+  if (started) {
+    mascots.play.lean();
+  }
+  const rect = padwrap.getBoundingClientRect();
+  countdownBox.style.setProperty('--countdown-y', `${rect.y + rect.height / 2}px`);
+  countdownBox.textContent = String(n);
+  countdownBox.dataset.n = String(n);
+  countdownBox.classList.remove('countdown--show');
+  void countdownBox.offsetWidth;
+  countdownBox.classList.add('countdown--show');
+  sound.cue('countdown', { n });
 }
 
-function finishExtra() {
-  sound.finale();
-  effects.finale();
-  showResult('エクストラ しゅうりょう', false, true);
-  crowd.parade();
+// MARK: - ゲームオーバー
+
+/** ハートが割れる (または正解の字を見せ終える) のを待ってからゲームオーバーの画面を出す */
+function scheduleGameover(delay) {
+  window.clearTimeout(gameoverTimer);
+  gameoverTimer = window.setTimeout(showGameover, delay);
 }
 
-function showResult(title, canGoExtra, celebrate) {
-  window.cancelAnimationFrame(frame);
-  clearPad();
-  drawHint(false);
-  quietStage();
+/** 終了画面: 得点・ドパ・最大コンボ・到達ステージ・あつめた字。観客はしょんぼり座る */
+function showGameover() {
+  if (game === null) {
+    return;
+  }
+  cancelJudge();
+  hideAnswer();
+  updateCountdown(null);
   const summary = game.summary();
-  displayDopa = summary.dopa;
-  dopaRoll = null;
-  updateDopa();
-  el('resultTitle').textContent = title;
-  countUp(el('resultScore'), summary.score, celebrate ? 900 : 0);
+  sound.cue('gameOver');
+  crowd.sulk(true);
+  mascots.play.gloom();
+  mascots.result.gloom();
+  effects.setFocus(null, 0);
+  props.setIntensity(0);
+  countUp(el('resultScore'), summary.score, 600);
   el('resultDopa').textContent = formatDopa(summary.dopa);
   el('resultCombo').textContent = String(summary.maxCombo);
-  el('resultCorrect').textContent = String(summary.correctCount);
-  el('resultClose').textContent = String(summary.closeCount);
+  el('resultStage').textContent = String(summary.stage);
+  el('resultCount').textContent = String(summary.collected.length);
+  el('resultChars').replaceChildren(...summary.collected.map((ch) => {
+    const span = document.createElement('span');
+    span.className = 'gameover__char';
+    span.textContent = ch;
+    return span;
+  }));
   const updated = recordBest(settings, summary);
   el('resultBest').textContent = updated.length > 0 ? 'さいこう きろく こうしん!' : '';
-  el('extraButton').style.display = canGoExtra ? '' : 'none';
-  showRecords();
-  show('result');
+  // ゲームオーバーでも つづきから はリトライと同じ位置 (失敗した問題、ライフ 3) で残る
+  persist();
+  // 観客の帯は見せたまま、その下 (あつめた字の帯) から重ねる
+  gameoverBox.style.top = `${el('collected').offsetTop}px`;
+  gameoverBox.hidden = false;
+  gameoverBox.classList.remove('gameover--in');
+  void gameoverBox.offsetWidth;
+  gameoverBox.classList.add('gameover--in');
+}
+
+/** 終了画面を閉じる。観客とマスコットは立ち直る */
+function hideGameover() {
+  window.clearTimeout(gameoverTimer);
+  if (!gameoverBox.hidden) {
+    mascots.play.correct(1);
+  }
+  gameoverBox.hidden = true;
+  crowd.sulk(false);
 }
 
 /** 数字を 0 から value まで転がす (duration が 0 ならそのまま出す) */
@@ -899,29 +1271,30 @@ function countUp(node, value, duration) {
   window.requestAnimationFrame(step);
 }
 
-el('extraButton').addEventListener('click', () => {
-  if (game === null) {
+/** リトライ: ライフ 3 に戻して、同じステージの失敗した問題から (得点・ドパ・あつめた字は保持) */
+el('retryButton').addEventListener('click', () => {
+  if (game === null || !game.retry()) {
     return;
   }
-  game.startExtra();
+  hideGameover();
   clearPad();
-  show('play');
+  resetHearts();
+  for (const heart of el('lives').children) {
+    heart.classList.add('heart--refill');
+  }
+  sound.cue('retry');
   renderQuestion();
   updateHud();
-  el('questionHint').textContent = `${EXTRA_MS / 1000} びょう! どんどん 書こう`;
-  loop();
 });
 
-el('againButton').addEventListener('click', () => {
-  newGame();
+el('restartButton').addEventListener('click', () => {
+  clearProgress();
+  sound.cue('retry');
+  newGame(null);
 });
 
 el('homeButton').addEventListener('click', () => {
-  game = null;
-  sound.stopMusic();
-  quietStage();
-  showRecords();
-  show('title');
+  goTitle();
 });
 
 // MARK: - 開始

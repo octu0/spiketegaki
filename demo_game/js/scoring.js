@@ -2,25 +2,18 @@
 //
 // 式は参考仕様のものを、1 問 1 マス (m = 1) の書き取りに当てはめたもの。
 
-/** 基本ラウンドの問題数 */
-export const BASE_QUESTIONS = 10;
+/** 1 ステージの問題数 */
+export const STAGE_QUESTIONS = 10;
 /** ドパ (常用対数) の上限 */
 export const DOPA_MAX = 9.08;
 /** 1 回の正解で必ず加わる最低のドパ増分 */
 export const DOPA_MIN_STEP = 0.003;
 /** ドパの節目 (常用対数)。100 / 1000 / 1万 / 10万 / 100万 / 1000万 / 1億 */
 const DOPA_MILESTONES = [2, 3, 4, 5, 6, 7, 8];
-/** コンボの制限時間 (ms)。1 字を何画も書くので、数字を打つ前提の 5.5 秒では足りない */
-export const COMBO_LIMIT_MS = 12000;
 /** この数以上のコンボが途切れたら終了数を表示する */
 export const COMBO_REPORT_MIN = 5;
-/** 観客の人数の下限・上限 */
-export const AUDIENCE_MIN = 2;
-export const AUDIENCE_MAX = 6;
 /** 電飾を点ける強度 E */
 export const LIGHTS_FROM = 0.6;
-/** コンボがここまで伸びると背景の回転が最速になる (虹色の縁取りと同じ数) */
-export const SPIN_FULL_COMBO = 20;
 /** 短く祝うコンボ数 (これ以降は 100 以上で 50 ごと) */
 const COMBO_CELEBRATIONS = [10, 20, 30, 50, 75];
 
@@ -31,37 +24,38 @@ function clamp(v, lo, hi) {
 // MARK: - 得点 (SPEC §5.1)
 
 /**
- * 得点。基本は 1 問 10 点 (10 問完走で 100 点)、エクストラの k 問目 (0 始まり) は 10 + 5k 点。
- * エクストラを n 問終えた合計は 100 + 10n + 5n(n−1)/2。
+ * 得点。ステージ 1 は 1 問 10 点 (10 問完走で 100 点)、ステージ 2 以降で k 問目 (0 始まり、
+ * ステージ 2 以降で正解した数) に正解すると 10 + 5k 点 (旧エクストラの式)。
+ * ステージ 2 以降で n 問正解した合計は 10 × (ステージ 1 の正解数) + 10n + 5n(n−1)/2。
  */
-export function score(baseSolved, extraSolved) {
-  const extra = 10 * extraSolved + 5 * extraSolved * (extraSolved - 1) / 2;
-  return 10 * baseSolved + extra;
+export function score(firstStageSolved, laterSolved) {
+  const later = 10 * laterSolved + 5 * laterSolved * (laterSolved - 1) / 2;
+  return 10 * firstStageSolved + later;
 }
 
-/** エクストラの k 問目 (0 始まり) の加点 */
+/** ステージ 2 以降の k 問目 (0 始まり、ステージ 2 以降で正解した数) の加点 */
 export function extraQuestionScore(k) {
   return 10 + 5 * k;
 }
 
 // MARK: - ドパ (SPEC §5.2)
 
-/** 基本の基準曲線 B(f) = 2.3 * clamp(f, 0, 1)^1.15 */
+/** ステージ 1 の基準曲線 B(f) = 2.3 * clamp(f, 0, 1)^1.15 */
 export function baseCurve(f) {
   return 2.3 * Math.pow(clamp(f, 0, 1), 1.15);
 }
 
-/** エクストラの基準曲線 X(n) = 2.3 + 3.0 * (1 − exp(−n / 10)) */
+/** ステージ 2 以降の基準曲線 X(n) = 2.3 + 3.0 * (1 − exp(−n / 10)) */
 export function extraCurve(n) {
   return 2.3 + 3.0 * (1 - Math.exp(-n / 10));
 }
 
-/** 基本の q 問目 (0 始まり、完了済み数) を解いたときの基準増分。1 問 1 マスなので m = 1 */
+/** ステージ 1 の q 問目 (0 始まり、問題の位置) を解いたときの基準増分。1 問 1 マスなので m = 1 */
 export function baseIncrement(q, total) {
   return baseCurve((q + 1) / total) - baseCurve(q / total);
 }
 
-/** エクストラの k 問目 (0 始まり、完了済み数) を解いたときの基準増分 */
+/** ステージ 2 以降の k 問目 (0 始まり、ステージ 2 以降で正解した数) を解いたときの基準増分 */
 export function extraIncrement(k) {
   return extraCurve(k + 1) - extraCurve(k);
 }
@@ -133,7 +127,7 @@ export function isComboReach(combo) {
 
 // MARK: - 演出強度 (SPEC §8)
 
-/** 基本の i 問目 (0 始まり) の演出強度 E = 0.08 + 0.92 * (i/(N−1))^1.3 */
+/** ステージ 1 の i 問目 (0 始まり) の演出強度 E = 0.08 + 0.92 * (i/(N−1))^1.3 */
 export function baseIntensity(index, total) {
   if (total <= 1) {
     return 1;
@@ -141,41 +135,20 @@ export function baseIntensity(index, total) {
   return 0.08 + 0.92 * Math.pow(clamp(index / (total - 1), 0, 1), 1.3);
 }
 
-/** エクストラの段 tier = floor(k/3) */
+/** ステージ 2 以降の段 tier = floor(k/3) (k = ステージ 2 以降で正解した数) */
 export function extraTier(k) {
   return Math.floor(k / 3);
 }
 
-/** エクストラの演出強度 E = 1 + min(0.5, tier * 0.1) */
+/** ステージ 2 以降の演出強度 E = 1 + min(0.5, tier * 0.1) */
 export function extraIntensity(k) {
   return 1 + Math.min(0.5, extraTier(k) * 0.1);
 }
 
-/** 基本の BGM テンポ (BPM) = 112 + min(1, E) * 16 */
-export function baseTempo(intensity) {
-  return 112 + Math.min(1, intensity) * 16;
-}
-
-/** エクストラの BGM テンポ (BPM) = 134 + tier * 5 */
-export function extraTempo(tier) {
-  return 134 + tier * 5;
-}
-
-/** 観客の人数。E が 0 のとき 2 人、E が 1 以上で 6 人 */
-export function audienceCount(intensity) {
-  const span = AUDIENCE_MAX - AUDIENCE_MIN;
-  return AUDIENCE_MIN + Math.round(span * clamp(intensity, 0, 1));
-}
-
-/** 背景 (サンバースト) の回転倍率。0 コンボで 1 倍、20 コンボ以上で 3 倍 */
-export function comboSpin(combo) {
-  return 1 + 2 * clamp(combo / SPIN_FULL_COMBO, 0, 1);
-}
-
 /**
- * 「あつめた字」の帯に並べる枠の数。ラウンドの 10 問ぶんを最初から空で見せ、
- * エクストラで 10 を越えたらその数だけ伸ばす。
+ * 「あつめた字」の帯に並べる枠の数。ステージ 1 の 10 問ぶんを最初から空で見せ、
+ * ステージをまたいで 10 を越えたらその数だけ伸ばす。
  */
 export function collectedSlots(collected) {
-  return Math.max(BASE_QUESTIONS, Math.max(0, Math.floor(collected)));
+  return Math.max(STAGE_QUESTIONS, Math.max(0, Math.floor(collected)));
 }

@@ -3,22 +3,19 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 import {
-  BASE_QUESTIONS,
-  COMBO_LIMIT_MS,
+  STAGE_QUESTIONS,
   DOPA_MAX,
   DOPA_MIN_STEP,
   advanceDopa,
   baseCurve,
   baseIncrement,
   baseIntensity,
-  baseTempo,
   comboMultiplier,
   crossedMilestones,
   extraCurve,
   extraIncrement,
   extraIntensity,
   extraQuestionScore,
-  extraTempo,
   extraTier,
   formatBestDopa,
   formatDopa,
@@ -26,23 +23,19 @@ import {
   score
 } from '../js/scoring.js';
 
-test('コンボの制限時間は 1 問 12 秒 (多画の字を書ききれる長さ)', () => {
-  assert.equal(COMBO_LIMIT_MS, 12000);
-});
-
-test('得点: 基本完走で 100 点', () => {
+test('得点: ステージ 1 の完走で 100 点', () => {
   assert.equal(score(0, 0), 0);
-  assert.equal(score(BASE_QUESTIONS, 0), 100);
+  assert.equal(score(STAGE_QUESTIONS, 0), 100);
 });
 
-test('得点: エクストラの表の値 (SPEC §5.1)', () => {
+test('得点: ステージ 2 以降の表の値 (旧エクストラ、SPEC §5.1)', () => {
   const table = [[5, 200], [10, 425], [15, 775], [23, 1595], [30, 2575]];
   for (const [n, expected] of table) {
-    assert.equal(score(BASE_QUESTIONS, n), expected, `エクストラ ${n} 問`);
+    assert.equal(score(STAGE_QUESTIONS, n), expected, `ステージ 2 以降 ${n} 問`);
   }
 });
 
-test('得点: エクストラ k 問目 (0 始まり) は 10 + 5k 点', () => {
+test('得点: ステージ 2 以降の k 問目 (0 始まり) は 10 + 5k 点', () => {
   assert.equal(extraQuestionScore(0), 10);
   assert.equal(extraQuestionScore(1), 15);
   assert.equal(extraQuestionScore(9), 55);
@@ -51,7 +44,7 @@ test('得点: エクストラ k 問目 (0 始まり) は 10 + 5k 点', () => {
   for (let k = 0; k < 15; k += 1) {
     sum += extraQuestionScore(k);
   }
-  assert.equal(100 + sum, score(BASE_QUESTIONS, 15));
+  assert.equal(100 + sum, score(STAGE_QUESTIONS, 15));
 });
 
 test('ドパ: 基準曲線 B(f) と X(n)', () => {
@@ -132,7 +125,7 @@ test('コンボ: 祝う数は 10/20/30/50/75 と 100 以上の 50 ごと', () =>
   }
 });
 
-test('演出強度とテンポ', () => {
+test('演出強度', () => {
   assert.ok(Math.abs(baseIntensity(0, 10) - 0.08) < 1e-12);
   assert.ok(Math.abs(baseIntensity(9, 10) - 1) < 1e-12);
   assert.equal(baseIntensity(0, 1), 1, '1 問だけのときは 1');
@@ -144,11 +137,6 @@ test('演出強度とテンポ', () => {
   assert.ok(Math.abs(extraIntensity(3) - 1.1) < 1e-12);
   assert.equal(extraIntensity(30), 1.5, '上限 1.5');
 
-  assert.ok(Math.abs(baseTempo(0.08) - 113.28) < 1e-12);
-  assert.equal(baseTempo(1), 128);
-  assert.equal(baseTempo(1.5), 128, 'min(1, E) で頭打ち');
-  assert.equal(extraTempo(0), 134);
-  assert.equal(extraTempo(3), 149);
 });
 
 // MARK: - 演出の第 2 段階 (リーチ・観客・背景の回転・あつめた字)
@@ -169,27 +157,8 @@ test('isComboReach: 0 コンボはリーチにしない (1 で祝いは無い)',
   assert.equal(isComboReach(-3), false);
 });
 
-test('audienceCount: E 0 で 2 人、E 1 以上で 6 人', async () => {
-  const { audienceCount, AUDIENCE_MIN, AUDIENCE_MAX } = await import('../js/scoring.js');
-  assert.equal(audienceCount(0), AUDIENCE_MIN);
-  assert.equal(audienceCount(0.08), 2);
-  assert.equal(audienceCount(0.5), 4);
-  assert.equal(audienceCount(1), AUDIENCE_MAX);
-  assert.equal(audienceCount(1.5), AUDIENCE_MAX);
-  assert.equal(audienceCount(-1), AUDIENCE_MIN);
-});
-
-test('comboSpin: 0 コンボで 1 倍、20 コンボ以上で 3 倍', async () => {
-  const { comboSpin, SPIN_FULL_COMBO } = await import('../js/scoring.js');
-  assert.equal(comboSpin(0), 1);
-  assert.equal(comboSpin(10), 2);
-  assert.equal(comboSpin(SPIN_FULL_COMBO), 3);
-  assert.equal(comboSpin(40), 3);
-  assert.equal(comboSpin(-5), 1);
-});
-
-test('collectedSlots: ラウンドの 10 枠は最初から、越えたぶんだけ伸びる', async () => {
-  const { collectedSlots, BASE_QUESTIONS: base } = await import('../js/scoring.js');
+test('collectedSlots: ステージ 1 の 10 枠は最初から、越えたぶんだけ伸びる', async () => {
+  const { collectedSlots, STAGE_QUESTIONS: base } = await import('../js/scoring.js');
   assert.equal(collectedSlots(0), base);
   assert.equal(collectedSlots(7), base);
   assert.equal(collectedSlots(base), base);

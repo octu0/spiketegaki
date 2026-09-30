@@ -1,7 +1,7 @@
 // 独自デザインのマスコット (SVG) と、その反応。
 //
 // 形は「墨のしずく」。上がとがった丸い体、白いおなか、丸い目、細い腕、小さな足。
-// 輪郭線は太め (ポップな 2D 風)。表情は 3 つ (笑顔・驚き・喜び) を重ねて置き、
+// 輪郭線は太め (ポップな 2D 風)。表情は 4 つ (笑顔・驚き・喜び・しょんぼり) を重ねて置き、
 // どれを出すかは CSS のクラスで切り替える (style.css の .mascot--* / .mascot__face--*)。
 
 const BODY = '#8fd8b5';
@@ -11,25 +11,49 @@ const CHEEK = '#f7a8c4';
 const LINE = '#2b2e5a';
 
 /**
- * マスコットの SVG。体の色だけを差し替えられるようにして、観客 (色違いの小さいマスコット) が
- * 同じ形を使えるようにする。
+ * マスコットの SVG。体の色だけを差し替えられるようにして、観客 (色違いの小さいマスコット) の
+ * スプライトが同じ形を使えるようにする。
  *
  * @param {string} body 体の色
  * @param {string} bodyDark 手足の色 (体より濃い色)
  */
-export function mascotSVG(body = BODY, bodyDark = BODY_DARK) {
+function mascotSVG(body = BODY, bodyDark = BODY_DARK) {
   return SVG.replaceAll(BODY, body).replaceAll(BODY_DARK, bodyDark);
 }
 
-/** 観客の体の色 (パステル 6 種) と、その濃い色 */
+/** 観客の体の色 (パステル 8 種) と、その濃い色 */
 export const CROWD_COLORS = [
   ['#f7a8c4', '#d9789c'],
   ['#f9d65c', '#d9a92f'],
   ['#7fb3f5', '#4d86cf'],
   ['#8fd8b5', '#4fb391'],
   ['#c7a6f0', '#9a72d1'],
-  ['#ffb37a', '#d9834a']
+  ['#ffb37a', '#d9834a'],
+  ['#9ee6e0', '#56b8b0'],
+  ['#f59f9f', '#d06464']
 ];
+
+/** 観客のスプライトの表情 */
+export const FACES = ['smile', 'joy', 'surprised', 'sad'];
+
+/**
+ * 観客のスプライト (canvas に事前ラスタライズする) の SVG。
+ * 腕は canvas 側で描く (伸ばしたり上げたりする) ので外し、表情は 1 つだけ残す。
+ *
+ * @param {string} body 体の色
+ * @param {string} bodyDark 手足の色
+ * @param {string} face FACES のどれか
+ */
+export function spriteSVG(body, bodyDark, face) {
+  return mascotSVG(body, bodyDark)
+    .replace(/<g class="mascot__arms">[\s\S]*?<\/g>/, '')
+    .replace(/<g class="mascot__face mascot__face--(\w+)">[\s\S]*?<\/g>/g,
+      (group, name) => (name === face ? group : ''))
+    .replace('<svg ', '<svg xmlns="http://www.w3.org/2000/svg" width="120" height="148" ');
+}
+
+/** スプライトの座標系 (SVG の viewBox 120 x 148)。足の裏が y = 136、肩が (22, 84) と (98, 84) */
+export const SPRITE_BOX = { width: 120, height: 148, feet: 136, shoulders: [[22, 84], [98, 84]] };
 
 const SVG = `
 <svg viewBox="0 0 120 148" class="mascot__svg" aria-hidden="true">
@@ -75,13 +99,22 @@ const SVG = `
     <path d="M49 84 q11 16 22 0 q-11 5 -22 0 Z" fill="${LINE}"/>
     <path d="M53 90 q7 5 14 0" stroke="${CHEEK}" stroke-width="3" stroke-linecap="round" fill="none"/>
   </g>
+
+  <!-- しょんぼり (ゲームオーバー) -->
+  <g class="mascot__face mascot__face--sad">
+    <path d="M36 63 L51 58" stroke="${LINE}" stroke-width="4" stroke-linecap="round" fill="none"/>
+    <path d="M69 58 L84 63" stroke="${LINE}" stroke-width="4" stroke-linecap="round" fill="none"/>
+    <ellipse cx="45" cy="74" rx="5" ry="6" fill="${LINE}"/>
+    <ellipse cx="75" cy="74" rx="5" ry="6" fill="${LINE}"/>
+    <path d="M50 92 q10 -9 20 0" stroke="${LINE}" stroke-width="4" stroke-linecap="round" fill="none"/>
+  </g>
 </svg>`;
 
-const REACTIONS = ['happy', 'cheer', 'sad', 'wobble', 'dance', 'spin', 'giant', 'clap', 'lean'];
-/** 反応ごとのアニメの長さ (ms)。終わったらクラスを外す */
+const REACTIONS = ['happy', 'cheer', 'sad', 'wobble', 'dance', 'spin', 'giant', 'clap', 'lean', 'gloom'];
+/** 反応ごとのアニメの長さ (ms)。終わったらクラスを外す。0 は次の反応まで続ける */
 const DURATIONS = {
   happy: 700, cheer: 1400, sad: 700, wobble: 700, dance: 1250,
-  spin: 1050, giant: 2250, clap: 700, lean: 900
+  spin: 1050, giant: 2250, clap: 700, lean: 900, gloom: 0
 };
 
 export class Mascot {
@@ -118,6 +151,9 @@ export class Mascot {
     this.host.style.setProperty('--mascot-amp', Math.min(1.5, Math.max(0.3, intensity)).toFixed(2));
     this.host.classList.add(`mascot--${name}`);
     window.clearTimeout(this.timer);
+    if (DURATIONS[name] === 0) {
+      return;
+    }
     this.timer = window.setTimeout(() => {
       this.host.classList.remove(`mascot--${name}`);
     }, DURATIONS[name]);
@@ -158,8 +194,13 @@ export class Mascot {
     this.react('clap', 1);
   }
 
-  /** リーチ: 身を乗り出す */
+  /** リーチ・カウントダウン: 身を乗り出す */
   lean() {
     this.react('lean', 1);
+  }
+
+  /** ゲームオーバー: しょんぼり座り込む (次の反応まで続く) */
+  gloom() {
+    this.react('gloom', 1);
   }
 }
