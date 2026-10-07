@@ -453,53 +453,305 @@ final class AugmenterTests: XCTestCase {
         }
     }
 
-    /// マス目基準では外接矩形の再正規化をしないので、変形で墨がマス目の端に触れたり
-    /// はみ出したりしてよい。はみ出しても値域 [0, 1]・1024 要素が壊れないことを見る。
-    func testAugmentMayTouchAndOverflowTheCellButStaysValid() throws {
-        // マス目いっぱいに近い画像を平行移動・拡大すれば必ずはみ出す
+    // MARK: - 見切れの禁止 (墨をマス目の外へ捨てない)
+
+    /// 外接矩形がマス目いっぱいの字: 外周の枠 + 十字 (線幅 2px)
+    private func fullCellFrame() throws -> CharacterImage {
+        let side = CharacterImage.side
         var p = [Float](repeating: 0.0, count: CharacterImage.pixelCount)
-        var y = 2
-        while y < 30 {
-            var x = 2
-            while x < 30 {
-                p[y * CharacterImage.side + x] = 1.0
+        var y = 0
+        while y < side {
+            var x = 0
+            while x < side {
+                let onBorder = x <= 1 || y <= 1 || x >= side - 2 || y >= side - 2
+                let onCross = abs(x - side / 2) <= 1 || abs(y - side / 2) <= 1
+                if onBorder || onCross {
+                    p[y * side + x] = 1.0
+                }
                 x += 1
             }
             y += 1
         }
-        let filled = try CharacterImage(pixels: p)
-        let aug = Augmenter(seed: 314159)
+        return try CharacterImage(pixels: p)
+    }
 
-        var sawEdgeInk = false
-        var sawInkLoss = false
-        var i = 0
-        while i < 200 {
-            let out = aug.augment(filled)
-            XCTAssertEqual(out.pixels.count, 1024, "\(i) 回目の要素数")
-            for v in out.pixels {
-                XCTAssertGreaterThanOrEqual(v, 0.0, "\(i) 回目に負の値")
-                XCTAssertLessThanOrEqual(v, 1.0, "\(i) 回目に 1 超え")
-                XCTAssertFalse(v.isNaN, "\(i) 回目に NaN")
+    /// 全面が墨の画像 (外接矩形 = マス目)
+    private func fullCellFilled() throws -> CharacterImage {
+        return try CharacterImage(pixels: [Float](repeating: 1.0, count: CharacterImage.pixelCount))
+    }
+
+    /// 右上の角に寄った濁点のような 2 つの点 (マス目の端に接する小さな墨)
+    private func cornerDots() throws -> CharacterImage {
+        let side = CharacterImage.side
+        var p = [Float](repeating: 0.0, count: CharacterImage.pixelCount)
+        for (cx, cy) in [(side - 6, 0), (side - 2, 1)] {
+            var y = cy
+            while y < cy + 3 {
+                var x = cx
+                while x < min(side, cx + 2) {
+                    p[y * side + x] = 1.0
+                    x += 1
+                }
+                y += 1
             }
-            let side = CharacterImage.side
+        }
+        return try CharacterImage(pixels: p)
+    }
+
+    /// 左下の角に接する 6x6 の四角
+    private func cornerSquare() throws -> CharacterImage {
+        let side = CharacterImage.side
+        var p = [Float](repeating: 0.0, count: CharacterImage.pixelCount)
+        var y = side - 6
+        while y < side {
+            var x = 0
+            while x < 6 {
+                p[y * side + x] = 1.0
+                x += 1
+            }
+            y += 1
+        }
+        return try CharacterImage(pixels: p)
+    }
+
+    /// 見切れの試験に使う字 (外接矩形がマス目いっぱいの字と、端・角に接する字を含む)
+    private func clippingCases() throws -> [(String, CharacterImage)] {
+        return [
+            ("マス目いっぱいの枠", try fullCellFrame()),
+            ("全面の墨", try fullCellFilled()),
+            ("右上の点", try cornerDots()),
+            ("左下の四角", try cornerSquare()),
+            ("中央の十字", try sampleImage()),
+            ("線幅 1px の L", try thinL())
+        ]
+    }
+
+    /// 墨 (値 > 0) の外接矩形。墨が無ければ nil
+    private func inkBounds(_ image: CharacterImage) -> (minX: Int, maxX: Int, minY: Int, maxY: Int)? {
+        let side = CharacterImage.side
+        var minX = side, maxX = -1, minY = side, maxY = -1
+        var y = 0
+        while y < side {
             var x = 0
             while x < side {
-                if out[x, 0] >= ImageNormalizer.inkThreshold
-                    || out[x, side - 1] >= ImageNormalizer.inkThreshold
-                    || out[0, x] >= ImageNormalizer.inkThreshold
-                    || out[side - 1, x] >= ImageNormalizer.inkThreshold {
-                    sawEdgeInk = true
+                if image[x, y] > 0.0 {
+                    minX = min(minX, x)
+                    maxX = max(maxX, x)
+                    minY = min(minY, y)
+                    maxY = max(maxY, y)
                 }
                 x += 1
             }
-            if out.inkSum < filled.inkSum * 0.98 {
-                sawInkLoss = true
-            }
-            i += 1
+            y += 1
         }
-        // 端に触れることも、はみ出して墨が減ることも起きてよい (旧方式では起き得なかった)
-        XCTAssertTrue(sawEdgeInk, "マス目の端に墨が届く事例が 1 度も無い")
-        XCTAssertTrue(sawInkLoss, "マス目からはみ出して墨が減る事例が 1 度も無い")
+        return maxX < 0 ? nil : (minX, maxX, minY, maxY)
+    }
+
+    /// `augment` が引く乱数を同じ順序で引き直す (膨張量 → せん断 → 回転 → 拡縮 → 平行移動 x, y)
+    private func drawnValues(seed: UInt64, parameters p: Augmenter.Parameters)
+        -> (dilation: Int, shear: Float, degrees: Float, scale: Float, dx: Float, dy: Float) {
+        let r = Augmenter(seed: seed, parameters: p)
+        let thickness = r.nextFloat01()
+        var dilation = 0
+        if p.maxDilationPixels > 0 && thickness < p.thicknessProbability {
+            dilation = min(p.maxDilationPixels, Int(thickness / (p.thicknessProbability / Float(p.maxDilationPixels))) + 1)
+        }
+        let shear = r.nextUniform(in: p.shearRange)
+        let degrees = r.nextUniform(in: p.rotationDegreesRange)
+        let scale = r.nextUniform(in: p.scaleRange)
+        let dx = r.nextUniform(in: p.translationRange)
+        let dy = r.nextUniform(in: p.translationRange)
+        return (dilation, shear, degrees, scale, dx, dy)
+    }
+
+    /// 幾何変形だけを効かせたパラメータ (膨張・弾性・ノイズ無し、幾何の範囲は既定のまま)
+    private var geometryOnlyParameters: Augmenter.Parameters {
+        return Augmenter.Parameters(
+            thicknessProbability: 0.0,
+            elasticAmplitude: 0.0,
+            gaussianNoiseSigma: 0.0,
+            saltPepperProbability: 0.0
+        )
+    }
+
+    /// `fitToCell` で絞った幾何変形の後、墨は各辺から `margin` px 以上内側にある。
+    /// 縮尺は引いた値以下 (拡大しない)。外接矩形がマス目いっぱいの字でも、余白 0〜5px のどれでも成り立つ。
+    func testFittedGeometryKeepsInkMarginInsideTheCell() throws {
+        let side = CharacterImage.side
+        let p = Augmenter.Parameters()
+        var shrunk = 0
+        var trials = 0
+        for (name, image) in try clippingCases() {
+            var seed: UInt64 = 1
+            while seed <= 300 {
+                let d = drawnValues(seed: seed, parameters: p)
+                let aug = Augmenter(seed: seed)
+                let margin = Int(seed % 6)
+                let fitted = aug.fitToCell(image, shear: d.shear, rotationDegrees: d.degrees,
+                                           scale: d.scale, dx: d.dx, dy: d.dy, margin: margin)
+                XCTAssertLessThanOrEqual(fitted.scale, d.scale, "\(name) seed \(seed): 拡大した")
+                XCTAssertGreaterThan(fitted.scale, 0.0, "\(name) seed \(seed): 縮尺が 0 以下")
+                if fitted.scale < d.scale { shrunk += 1 }
+                trials += 1
+                let out = aug.affine(image, shear: d.shear, rotationDegrees: d.degrees,
+                                     scale: fitted.scale, dx: fitted.dx, dy: fitted.dy)
+                guard let b = inkBounds(out) else {
+                    XCTFail("\(name) seed \(seed): 墨が消えた")
+                    seed += 1
+                    continue
+                }
+                XCTAssertGreaterThanOrEqual(b.minX, margin, "\(name) seed \(seed) 余白 \(margin): 左へ出た")
+                XCTAssertGreaterThanOrEqual(b.minY, margin, "\(name) seed \(seed) 余白 \(margin): 上へ出た")
+                XCTAssertLessThanOrEqual(b.maxX, side - 1 - margin, "\(name) seed \(seed) 余白 \(margin): 右へ出た")
+                XCTAssertLessThanOrEqual(b.maxY, side - 1 - margin, "\(name) seed \(seed) 余白 \(margin): 下へ出た")
+                seed += 1
+            }
+        }
+        print("[fit] 縮尺を下げた割合 = \(shrunk) / \(trials)")
+        XCTAssertGreaterThan(shrunk, 0, "マス目いっぱいの字でも縮尺を下げていない")
+    }
+
+    /// 収まる字は動かさない: 中央の小さな字に余白 0 で引いた値は、そのまま返る
+    func testFitToCellKeepsDrawnValuesWhenTheInkFits() throws {
+        let image = try smallSquare()
+        let aug = Augmenter(seed: 1)
+        let fitted = aug.fitToCell(image, shear: 0.2, rotationDegrees: 7.0, scale: 1.1,
+                                   dx: -4.5, dy: 3.5, margin: 2)
+        XCTAssertEqual(fitted.scale, 1.1)
+        XCTAssertEqual(fitted.dx, -4.5)
+        XCTAssertEqual(fitted.dy, 3.5)
+        // 墨の無い画像もそのまま
+        let empty = aug.fitToCell(CharacterImage(), shear: 0.0, rotationDegrees: 0.0, scale: 1.15,
+                                  dx: 5.0, dy: -5.0, margin: 4)
+        XCTAssertEqual(empty.scale, 1.15)
+        XCTAssertEqual(empty.dx, 5.0)
+        XCTAssertEqual(empty.dy, -5.0)
+    }
+
+    /// `affine` と同じ逆写像 + 双一次補間を、マス目の外側 `pad` px まで広げた仮想キャンバスで計算した墨の総量。
+    /// マス目の中の総量がこれと一致すれば、マス目の外へ捨てた墨は無い。
+    private func unclippedAffineInk(
+        _ image: CharacterImage, shear: Float, rotationDegrees: Float, scale: Float,
+        dx: Float, dy: Float, pad: Int = 48
+    ) -> Float {
+        let side = CharacterImage.side
+        let center = Float(side) * 0.5 - 0.5
+        let theta = rotationDegrees * Float.pi / 180.0
+        let a = scale * cos(theta)
+        let b = scale * (cos(theta) * shear - sin(theta))
+        let c = scale * sin(theta)
+        let d = scale * (sin(theta) * shear + cos(theta))
+        let det = a * d - b * c
+        var total: Float = 0.0
+        var y = -pad
+        while y < side + pad {
+            let v = Float(y) - center - dy
+            var x = -pad
+            while x < side + pad {
+                let u = Float(x) - center - dx
+                let sx = (d * u - b * v) / det + center
+                let sy = (-c * u + a * v) / det + center
+                total += ImageNormalizer.sampleBilinear(ink: image.pixels, width: side, height: side, x: sx, y: sy)
+                x += 1
+            }
+            y += 1
+        }
+        return total
+    }
+
+    /// 膨張・弾性・ノイズを止めた `augment` は、引いた値を `fitToCell` で絞った幾何変形と画素単位で一致し、
+    /// マス目の中の墨の総量は、同じ変形をマス目の外まで広げて計算した総量と一致する (はみ出して捨てた墨が無い)。
+    /// 絞らずに引いた値のまま変形すると、マス目いっぱいの字や端の字では墨が減ることも確かめる
+    /// (この試験が見切れを検出できることの確認)。
+    func testAugmentKeepsInkAmountWithoutClipping() throws {
+        let p = geometryOnlyParameters
+        var rawLosses = 0
+        var worstRaw: Float = 1.0
+        for (name, image) in try clippingCases() {
+            var seed: UInt64 = 1
+            while seed <= 300 {
+                let d = drawnValues(seed: seed, parameters: p)
+                let ref = Augmenter(seed: 1)
+                let fitted = ref.fitToCell(image, shear: d.shear, rotationDegrees: d.degrees,
+                                           scale: d.scale, dx: d.dx, dy: d.dy, margin: 0)
+                let expected = ref.affine(image, shear: d.shear, rotationDegrees: d.degrees,
+                                          scale: fitted.scale, dx: fitted.dx, dy: fitted.dy)
+                let out = Augmenter(seed: seed, parameters: p).augment(image)
+                XCTAssertEqual(out.pixels, expected.pixels, "\(name) seed \(seed): 絞った幾何変形と一致しない")
+
+                let unclipped = unclippedAffineInk(image, shear: d.shear, rotationDegrees: d.degrees,
+                                                   scale: fitted.scale, dx: fitted.dx, dy: fitted.dy)
+                XCTAssertEqual(out.inkSum / unclipped, 1.0, accuracy: 1e-4,
+                               "\(name) seed \(seed): マス目の外へ墨が出た")
+
+                let raw = ref.affine(image, shear: d.shear, rotationDegrees: d.degrees,
+                                     scale: d.scale, dx: d.dx, dy: d.dy)
+                let rawUnclipped = unclippedAffineInk(image, shear: d.shear, rotationDegrees: d.degrees,
+                                                      scale: d.scale, dx: d.dx, dy: d.dy)
+                let rawRatio = raw.inkSum / rawUnclipped
+                if rawRatio < 0.999 { rawLosses += 1 }
+                worstRaw = min(worstRaw, rawRatio)
+                seed += 1
+            }
+        }
+        print("[clip] 絞らない変形で墨が減った回数 \(rawLosses) / 最小の残存比 \(String(format: "%.4f", worstRaw))")
+        XCTAssertGreaterThan(rawLosses, 0, "絞らない変形でも墨が減らない (試験が見切れを検出できていない)")
+    }
+
+    /// 膨張する場合も、膨張後の墨の外接矩形は幾何変形後の外接矩形を全方向に膨張量だけ広げたものになり
+    /// (マス目の端で切れていない)、弾性変形の余白 ceil(振幅) px が残る。
+    /// `augment` の出力は、この段ごとの計算 (幾何 → 膨張 → 弾性) と画素単位で一致する。
+    /// 既定パラメータからノイズだけを止め、膨張は必ず起きるようにする。
+    func testDilationAndElasticMarginsAreReserved() throws {
+        let side = CharacterImage.side
+        var p = Augmenter.Parameters(gaussianNoiseSigma: 0.0, saltPepperProbability: 0.0)
+        p.thicknessProbability = 1.0
+        let elasticMargin = Int(p.elasticAmplitude.rounded(.up))
+        var dilated = [0, 0, 0]
+        for (name, image) in try clippingCases() {
+            var seed: UInt64 = 1
+            while seed <= 200 {
+                let d = drawnValues(seed: seed, parameters: p)
+                XCTAssertGreaterThan(d.dilation, 0)
+                dilated[d.dilation] += 1
+                let ref = Augmenter(seed: 1)
+                let fitted = ref.fitToCell(image, shear: d.shear, rotationDegrees: d.degrees,
+                                           scale: d.scale, dx: d.dx, dy: d.dy,
+                                           margin: d.dilation + elasticMargin)
+                var stage = ref.affine(image, shear: d.shear, rotationDegrees: d.degrees,
+                                       scale: fitted.scale, dx: fitted.dx, dy: fitted.dy)
+                let before = try XCTUnwrap(inkBounds(stage), "\(name) seed \(seed)")
+                var k = 0
+                while k < d.dilation {
+                    stage = ref.dilate(stage)
+                    k += 1
+                }
+                let after = try XCTUnwrap(inkBounds(stage), "\(name) seed \(seed)")
+                XCTAssertEqual(after.minX, before.minX - d.dilation, "\(name) seed \(seed): 左で膨張が切れた")
+                XCTAssertEqual(after.minY, before.minY - d.dilation, "\(name) seed \(seed): 上で膨張が切れた")
+                XCTAssertEqual(after.maxX, before.maxX + d.dilation, "\(name) seed \(seed): 右で膨張が切れた")
+                XCTAssertEqual(after.maxY, before.maxY + d.dilation, "\(name) seed \(seed): 下で膨張が切れた")
+                XCTAssertGreaterThanOrEqual(after.minX, elasticMargin, "\(name) seed \(seed)")
+                XCTAssertGreaterThanOrEqual(after.minY, elasticMargin, "\(name) seed \(seed)")
+                XCTAssertLessThanOrEqual(after.maxX, side - 1 - elasticMargin, "\(name) seed \(seed)")
+                XCTAssertLessThanOrEqual(after.maxY, side - 1 - elasticMargin, "\(name) seed \(seed)")
+
+                // augment 全体の出力は、この膨張後の画像を同じ乱数位置の変位場で歪めたものと一致する
+                // (変位は最大 elasticAmplitude px なので、残した余白の外へは出ない)
+                let replay = Augmenter(seed: seed, parameters: p)
+                var r = 0
+                while r < 6 {          // 膨張量 1 + 幾何 5 個
+                    _ = replay.nextFloat01()
+                    r += 1
+                }
+                let expected = replay.elasticDeform(stage, amplitude: p.elasticAmplitude, sigma: p.elasticSigma)
+                let out = Augmenter(seed: seed, parameters: p).augment(image)
+                XCTAssertEqual(out.pixels, expected.pixels, "\(name) seed \(seed): 段ごとの計算と一致しない")
+                seed += 1
+            }
+        }
+        XCTAssertGreaterThan(dilated[1], 0, "1px 膨張が起きていない")
+        XCTAssertGreaterThan(dilated[2], 0, "2px 膨張が起きていない")
     }
 
     /// 拡張の途中で外接矩形の再正規化をしていないこと。

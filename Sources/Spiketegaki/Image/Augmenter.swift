@@ -3,8 +3,12 @@
 ///
 /// `augment(_:)` の順序:
 ///   幾何変形 (せん断・回転・平行移動・拡縮、いずれもマス目中心基準) → 膨張
-///   → 弾性変形 → 値域を [0, 1] にクランプ (マス目外へ出た墨は捨てる)
-///   → 最後にノイズ (ガウス・ごま塩)。
+///   → 弾性変形 → 値域を [0, 1] にクランプ → 最後にノイズ (ガウス・ごま塩)。
+///
+/// 墨をマス目の外へ捨てない (見切れた字はラベルノイズになる。濁点・半濁点が欠けると
+/// ビ → ヒ になる)。幾何変形後の墨の外接矩形に膨張量と弾性変形の振幅の余白を足した矩形が
+/// マス目に収まるよう、引いた平行移動を収まる区間に絞り、それでも収まらない大きさなら
+/// 縮尺を収まるまで下げる (`fitToCell`)。
 ///
 /// マス目基準なので外接矩形の再正規化は行わない。再正規化すると墨の絶対的な
 /// 位置と大きさが失われ、濁点・半濁点や英大小文字の区別が消えてしまう。
@@ -85,34 +89,50 @@ public final class Augmenter: @unchecked Sendable {
 
     /// 型の doc コメントに書いた順序で 1 回分の拡張を行う。
     public func augment(_ image: CharacterImage) -> CharacterImage {
+        // 太さ: 確率 thicknessProbability で膨張する。膨張量は 1〜maxDilationPixels px の等確率。
+        // 乱数は 1 個だけ引き、その値を等幅の区画に割って px 数に読み替える
+        // (確率と px 数で 2 個引くと、太さを変えたときに以降の乱数系列がずれる)。
+        // 幾何変形より先に引くのは、実際に膨張する px 数だけをマス目の余白に取るため
+        let thickness = nextFloat01()
+        var dilation = 0
+        if parameters.maxDilationPixels > 0 && thickness < parameters.thicknessProbability {
+            let step = parameters.thicknessProbability / Float(parameters.maxDilationPixels)
+            dilation = Int(thickness / step) + 1
+            if dilation > parameters.maxDilationPixels { dilation = parameters.maxDilationPixels }
+        }
+
         let shearAmount = nextUniform(in: parameters.shearRange)
         let degrees = nextUniform(in: parameters.rotationDegreesRange)
-        let scaleFactor = nextUniform(in: parameters.scaleRange)
-        let dx = nextUniform(in: parameters.translationRange)
-        let dy = nextUniform(in: parameters.translationRange)
+        let drawnScale = nextUniform(in: parameters.scaleRange)
+        let drawnDx = nextUniform(in: parameters.translationRange)
+        let drawnDy = nextUniform(in: parameters.translationRange)
+
+        // 膨張と弾性変形で墨が広がる分を余白に取り、墨がマス目の外へ出ないよう絞る
+        let elasticMargin = parameters.elasticAmplitude > 0.0
+            ? Int(parameters.elasticAmplitude.rounded(.up)) : 0
+        let fitted = fitToCell(
+            image,
+            shear: shearAmount,
+            rotationDegrees: degrees,
+            scale: drawnScale,
+            dx: drawnDx,
+            dy: drawnDy,
+            margin: dilation + elasticMargin
+        )
 
         var out = affine(
             image,
             shear: shearAmount,
             rotationDegrees: degrees,
-            scale: scaleFactor,
-            dx: dx,
-            dy: dy
+            scale: fitted.scale,
+            dx: fitted.dx,
+            dy: fitted.dy
         )
 
-        // 太さ: 確率 thicknessProbability で膨張する。膨張量は 1〜maxDilationPixels px の等確率。
-        // 乱数は 1 個だけ引き、その値を等幅の区画に割って px 数に読み替える
-        // (確率と px 数で 2 個引くと、太さを変えたときに以降の乱数系列がずれる)。
-        let thickness = nextFloat01()
-        if parameters.maxDilationPixels > 0 && thickness < parameters.thicknessProbability {
-            let step = parameters.thicknessProbability / Float(parameters.maxDilationPixels)
-            var pixels = Int(thickness / step) + 1
-            if pixels > parameters.maxDilationPixels { pixels = parameters.maxDilationPixels }
-            var k = 0
-            while k < pixels {
-                out = dilate(out)
-                k += 1
-            }
+        var k = 0
+        while k < dilation {
+            out = dilate(out)
+            k += 1
         }
 
         out = elasticDeform(
@@ -128,10 +148,96 @@ public final class Augmenter: @unchecked Sendable {
         return out
     }
 
-    /// 値域を [0, 1] に収める。マス目の外へ出た墨は既に捨てられている
-    /// (アフィン変形も弾性変形も範囲外を紙 0 として読むため)。
+    /// 値域を [0, 1] に収める (墨の位置は変えない。マス目の外へ墨が出ないことは `fitToCell` が保証する)。
     public func clampToCell(_ image: CharacterImage) -> CharacterImage {
         return (try? CharacterImage(pixels: image.pixels)) ?? CharacterImage()
+    }
+
+    // MARK: - マス目に収める
+
+    /// 引いた幾何変形を、墨がマス目の外へ出ない値に絞る。
+    ///
+    /// 元画像の墨 (値 > 0 の画素) を順写像 (`affine` の逆) で写した外接矩形を、
+    /// 双一次補間で墨が届く幅 (写した 1 画素の近傍 ±1 の広がり) 込みで測り、
+    /// その外側に `margin` px の余白 (後段の膨張量 + 弾性変形の振幅の切り上げ) を足した矩形が
+    /// マス目に収まるようにする。収まる区間に `dx` / `dy` をクランプし、区間が空になる大きさなら
+    /// 縮尺を収まるまで下げる (拡大はしない)。墨が無い画像はそのまま返す。
+    ///
+    /// 余白の根拠: 写した後の墨の画素が各辺から `margin` px 以上離れていれば、膨張 d px で
+    /// `margin - d` px 以上、弾性変形 (最大変位 a) の逆写像は ceil(a) - 1 - a > -1 より内側しか
+    /// 読まないので、出力の墨はマス目の中に収まる。
+    func fitToCell(
+        _ image: CharacterImage,
+        shear: Float,
+        rotationDegrees: Float,
+        scale: Float,
+        dx: Float,
+        dy: Float,
+        margin: Int
+    ) -> (scale: Float, dx: Float, dy: Float) {
+        let side = CharacterImage.side
+        let center = Float(side) * 0.5 - 0.5
+        let theta = rotationDegrees * Float.pi / 180.0
+        let cosT = cos(theta)
+        let sinT = sin(theta)
+        // 縮尺 1 の順写像 (affine と同じ M = Rot(theta) * Shear(shear))
+        let a = cosT
+        let b = cosT * shear - sinT
+        let c = sinT
+        let d = sinT * shear + cosT
+
+        var minX = Float.greatestFiniteMagnitude
+        var maxX = -Float.greatestFiniteMagnitude
+        var minY = Float.greatestFiniteMagnitude
+        var maxY = -Float.greatestFiniteMagnitude
+        var y = 0
+        while y < side {
+            let v = Float(y) - center
+            var x = 0
+            while x < side {
+                if image.pixels[y * side + x] > 0.0 {
+                    let u = Float(x) - center
+                    let px = a * u + b * v
+                    let py = c * u + d * v
+                    if px < minX { minX = px }
+                    if px > maxX { maxX = px }
+                    if py < minY { minY = py }
+                    if py > maxY { maxY = py }
+                }
+                x += 1
+            }
+            y += 1
+        }
+        if maxX < minX {
+            return (scale, dx, dy)
+        }
+        // 双一次補間で 1 画素の墨が届く範囲 (元の ±1 の正方形を写した広がり)
+        let spreadX = abs(a) + abs(b)
+        let spreadY = abs(c) + abs(d)
+        minX -= spreadX
+        maxX += spreadX
+        minY -= spreadY
+        maxY += spreadY
+
+        // 墨が届く範囲は開区間なので、写した位置が [margin - 1, side - margin] に入れば足りる。
+        // 丸め誤差のぶん内側に epsilon を取る
+        let epsilon: Float = 1e-3
+        let lower = Float(margin - 1) + epsilon
+        let upper = Float(side - margin) - epsilon
+        let room = upper - lower
+        if room <= 0.0 {
+            return (scale, dx, dy)
+        }
+        var s = scale
+        let spanX = maxX - minX
+        let spanY = maxY - minY
+        if s * spanX > room { s = room / spanX }
+        if s * spanY > room { s = room / spanY }
+
+        // center + s * min + t >= lower, center + s * max + t <= upper
+        let fx = min(max(dx, lower - center - s * minX), upper - center - s * maxX)
+        let fy = min(max(dy, lower - center - s * minY), upper - center - s * maxY)
+        return (s, fx, fy)
     }
 
     // MARK: - アフィン変形 (逆写像 + 双一次補間)

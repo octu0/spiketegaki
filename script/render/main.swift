@@ -378,7 +378,7 @@ func printUsage() {
       --font-filter <regex>   PostScript 名かファイル名がこの正規表現に当たるフォントだけ使う
       --require-script <a,b>  指定した区分のグリフを 1 つ以上持つフォントだけ使う
                               (例: --require-script hiragana で日本語フォントだけに絞る)
-      --list-fonts            読み込めたフォントと被覆率を表示して終了
+      --list-fonts            読み込めたフォントと被覆率・マス目への配置を表示して終了
       --list-fonts-tsv <path> --list-fonts のとき TSV を書き出す先 (既定 .tmp/reports/fonts_list.tsv)
       --contact-sheet <dir>   読み込めた全書体の目視確認シート (PNG) を書き出して終了する。
                               確認文字列を 1 行に並べ、40 書体で 1 ページ。
@@ -434,6 +434,8 @@ final class FontEntry: @unchecked Sendable {
     let drawable: [(index: Int, scalar: Unicode.Scalar, category: ScriptCategory)]
     /// --kanji-max-weight を超えたので漢字を描かなかったか
     let kanjiExcludedByWeight: Bool
+    /// マス目への配置 (全サイズ共通)
+    let layout: FontLayout
 
     init(
         postScriptName: String,
@@ -441,7 +443,8 @@ final class FontEntry: @unchecked Sendable {
         fontsBySize: [Int: CTFont],
         coverage: [ScriptCategory: (have: Int, total: Int)],
         drawable: [(index: Int, scalar: Unicode.Scalar, category: ScriptCategory)],
-        kanjiExcludedByWeight: Bool
+        kanjiExcludedByWeight: Bool,
+        layout: FontLayout
     ) {
         self.postScriptName = postScriptName
         self.origin = origin
@@ -449,6 +452,7 @@ final class FontEntry: @unchecked Sendable {
         self.coverage = coverage
         self.drawable = drawable
         self.kanjiExcludedByWeight = kanjiExcludedByWeight
+        self.layout = layout
     }
 }
 
@@ -598,7 +602,10 @@ enum FontLoader {
             fontsBySize: fonts,
             coverage: coverage,
             drawable: drawable,
-            kanjiExcludedByWeight: heavyForKanji && hasKanji
+            kanjiExcludedByWeight: heavyForKanji && hasKanji,
+            // 配置は最大の描画サイズで測る (辞書の並びは実行ごとに変わるので first は使わない。
+            // 外接矩形はサイズでわずかに変わるため、測るサイズを固定して決定的にする)
+            layout: FontLayout.measure(font: fonts[fonts.keys.max()!]!, scalars: drawable.map { $0.scalar })
         )
     }
 }
@@ -639,73 +646,352 @@ struct SplitMix64 {
 
 // MARK: - 描画
 
+/// 書体ごとのマス目への配置。長さはすべて em を 1 とした比率なので、どの描画サイズでも同じ配置になる。
+///
+/// 字ごとには中央寄せしない (句読点・小さい記号・小書きの位置と大きさを残すため)。
+/// ベースラインは書体で 1 つ、縮尺と縦の最小限のずらしは書体の区分 (`ScaleGroup`) ごとに決め、
+/// それでもマス目に収まらない字だけを個別に直す (`GlyphRenderer`)。
+struct FontLayout: Sendable {
+    /// 縮尺を別々に決める区分。英字のディセンダや括弧が em の下へ出る分で、
+    /// かなや漢字まで縮めないために分ける
+    enum ScaleGroup: String, Sendable, CaseIterable {
+        case kana
+        case alnumSymbols
+        case kanji
+
+        init(_ category: ScriptCategory) {
+            switch category {
+            case .hiragana, .katakana: self = .kana
+            case .digits, .asciiSymbols, .latinUpper, .latinLower: self = .alnumSymbols
+            case .kanjiLevel1: self = .kanji
+            }
+        }
+
+        /// 語彙の外の字 (コンタクトシートの句読点など) も含めた区分。
+        /// 語彙にあればその区分、無ければ Unicode のブロックで決める
+        init(_ scalar: Unicode.Scalar) {
+            if let index = FontLayout.vocabularyIndex[scalar] {
+                self.init(CharacterVocabulary.shared.category(of: index))
+            } else if (0x3000 ... 0x30FF).contains(scalar.value) {
+                self = .kana
+            } else if (0x3400 ... 0x9FFF).contains(scalar.value) {
+                self = .kanji
+            } else {
+                self = .alnumSymbols
+            }
+        }
+
+        var label: String {
+            switch self {
+            case .kana: return "かな"
+            case .alnumSymbols: return "英数"
+            case .kanji: return "漢字"
+            }
+        }
+    }
+
+    /// 語彙の字 → クラス index
+    static let vocabularyIndex: [Unicode.Scalar: Int] = {
+        var out = [Unicode.Scalar: Int]()
+        for (i, c) in CharacterVocabulary.shared.allCharacters.enumerated() {
+            out[c.unicodeScalars.first!] = i
+        }
+        return out
+    }()
+
+    /// ベースラインの決め方
+    enum Basis: String, Sendable {
+        /// OS/2 の sTypoAscender - sTypoDescender が unitsPerEm に一致する書体。
+        /// ベースラインはマス目の底から |sTypoDescender| 上げた位置
+        case typo
+        /// 一致しない書体。代表字の外接矩形の和をマス目の縦中央に置く
+        case representative
+        /// 代表字も欧文の代表字も持たない書体。対象グリフ全体の外接矩形の和を縦中央に置く
+        case allGlyphs
+
+        var label: String {
+            switch self {
+            case .typo: return "typo"
+            case .representative: return "代表字"
+            case .allGlyphs: return "全字"
+            }
+        }
+    }
+
+    let basis: Basis
+    /// 縮尺 1 のときのベースラインの高さ (マス目の底から、em 比)
+    let baseline: CGFloat
+    /// 区分ごとの縮尺 (マス目の中心が基準、1 以下)。対象グリフが無い区分は持たない
+    let scales: [ScaleGroup: CGFloat]
+    /// 区分ごとの縦のずらし (em 比、上向き正)。縮尺だけでは上下へ出る区分だけ 0 でない
+    let offsets: [ScaleGroup: CGFloat]
+
+    /// 区分の縮尺。対象グリフが無かった区分 (コンタクトシートで --scripts の外の字を描くとき) は 1
+    func scale(for group: ScaleGroup) -> CGFloat {
+        return scales[group] ?? 1.0
+    }
+
+    /// 区分の縦のずらし。対象グリフが無かった区分は 0
+    func offset(for group: ScaleGroup) -> CGFloat {
+        return offsets[group] ?? 0.0
+    }
+
+    /// typo 値が em に一致するとみなす許容幅 (unitsPerEm 比)
+    static let typoTolerance = 0.02
+    /// 代表字。無い字は飛ばす
+    static let representativeChars: [Character] = ["国", "あ", "口", "永"]
+    /// 代表字が 1 つも無い (欧文専用) 書体の代表字
+    static let latinRepresentativeChars: [Character] = ["A", "H", "x"]
+    /// 区分ごとの縮尺で収める対象グリフの割合。残りの外れ値 (| や g など) はグリフ単位で直す。
+    /// 余白は取らずマス目そのものに収める (拡張の余白は Augmenter が取る)。
+    /// 98% や余白 1px では字が小さくなりすぎた (2026-10-01 実測: 英数の高さの中央値 0.750 → 0.688)
+    static let fitQuantile = 0.95
+
+    /// グリフの外接矩形 (グリフ原点基準、em 比)。空なら nil
+    static func bounds(_ font: CTFont, _ glyph: CGGlyph) -> CGRect? {
+        var g = glyph
+        var r = CGRect.zero
+        CTFontGetBoundingRectsForGlyphs(font, .default, &g, &r, 1)
+        if r.isNull || r.isInfinite || r.width <= 0 || r.height <= 0 {
+            return nil
+        }
+        let size = CTFontGetSize(font)
+        return CGRect(x: r.minX / size, y: r.minY / size, width: r.width / size, height: r.height / size)
+    }
+
+    /// 字送り幅 (em 比)
+    static func advance(_ font: CTFont, _ glyph: CGGlyph) -> CGFloat {
+        var g = glyph
+        var a = CGSize.zero
+        CTFontGetAdvancesForGlyphs(font, .default, &g, &a, 1)
+        return a.width / CTFontGetSize(font)
+    }
+
+    /// 統計行・--list-fonts 用の 1 行表示
+    var summary: String {
+        return "配置 \(basis.label) ベースライン \(String(format: "%.3f", baseline)) 縮尺 \(scaleSummary)"
+    }
+
+    /// コンタクトシートの書体名の下に添える短い表示 (例 "typo 0.141 か0.95 英0.80 漢0.96")
+    var compactSummary: String {
+        var out = "\(basis.label) \(String(format: "%.3f", baseline))"
+        for g in ScaleGroup.allCases {
+            if let v = scales[g] {
+                out += " \(g.label.prefix(1))\(String(format: "%.2f", v))"
+                let o = offset(for: g)
+                if o != 0.0 {
+                    out += String(format: "%+.2f", o)
+                }
+            }
+        }
+        return out
+    }
+
+    /// 対象グリフのある区分の縮尺と縦のずらし (例 "かな 0.952 英数 0.801+0.031")
+    var scaleSummary: String {
+        let parts = ScaleGroup.allCases.compactMap { g in
+            scales[g].map { v -> String in
+                let o = offset(for: g)
+                return "\(g.label) \(String(format: "%.3f", v))" + (o != 0.0 ? String(format: "%+.3f", o) : "")
+            }
+        }
+        return parts.isEmpty ? "-" : parts.joined(separator: " ")
+    }
+
+    /// 縮尺 1 でのマス目上の外接矩形 (マス目の左下 = 原点、em 比)
+    func cellRect(bounds: CGRect, advance: CGFloat) -> CGRect {
+        return bounds.offsetBy(dx: (1.0 - advance) * 0.5, dy: baseline)
+    }
+
+    /// OS/2 の (sTypoAscender, sTypoDescender, unitsPerEm)。テーブルが無ければ nil
+    static func typoMetrics(_ font: CTFont) -> (ascender: Int, descender: Int, unitsPerEm: Int)? {
+        guard let data = CTFontCopyTable(font, CTFontTableTag(kCTFontTableOS2), []) as Data?,
+              data.count >= 72 else {
+            return nil
+        }
+        func int16(_ offset: Int) -> Int {
+            let hi = UInt16(data[data.startIndex + offset])
+            let lo = UInt16(data[data.startIndex + offset + 1])
+            return Int(Int16(bitPattern: (hi << 8) | lo))
+        }
+        return (int16(68), int16(70), Int(CTFontGetUnitsPerEm(font)))
+    }
+
+    /// 書体の配置を決める。`scalars` はその実行で描く対象グリフ (--scripts の範囲)。
+    static func measure(font: CTFont, scalars: [Unicode.Scalar]) -> FontLayout {
+        let basis: Basis
+        let baseline: CGFloat
+        if let typo = typoMetrics(font), typo.unitsPerEm > 0,
+           abs(Double(typo.ascender - typo.descender - typo.unitsPerEm))
+               <= typoTolerance * Double(typo.unitsPerEm) {
+            basis = .typo
+            baseline = CGFloat(-typo.descender) / CGFloat(typo.unitsPerEm)
+        } else {
+            // 代表字の外接矩形の和の縦中央をマス目の縦中央に合わせる
+            func union(_ chars: [Unicode.Scalar]) -> CGRect? {
+                var out: CGRect?
+                for s in chars {
+                    guard let g = FontLoader.glyph(font, s), let b = bounds(font, g) else {
+                        continue
+                    }
+                    out = out.map { $0.union(b) } ?? b
+                }
+                return out
+            }
+            let japanese = union(representativeChars.map { $0.unicodeScalars.first! })
+            let latin = japanese == nil ? union(latinRepresentativeChars.map { $0.unicodeScalars.first! }) : nil
+            if let r = japanese ?? latin {
+                basis = .representative
+                baseline = 0.5 - r.midY
+            } else if let r = union(scalars) {
+                basis = .allGlyphs
+                baseline = 0.5 - r.midY
+            } else {
+                basis = .allGlyphs
+                baseline = 0.5
+            }
+        }
+
+        // 区分ごとの縮尺とずらし。マス目に、その区分の対象グリフの 95% が収まるようにする。
+        // 横: 字送り幅の中央に置くので、マス目中心基準の縮尺だけで収める。
+        // 縦: 下端の 5 パーセンタイルから上端の 95 パーセンタイルまでの高さが収まる縮尺
+        //     (マス目中心基準) にし、それでも上下どちらかへ出るなら最小限だけ縦にずらす。
+        // 拡大はしない
+        let unscaled = FontLayout(basis: basis, baseline: baseline, scales: [:], offsets: [:])
+        var rects = [ScaleGroup: [CGRect]]()
+        for s in scalars {
+            guard let g = FontLoader.glyph(font, s), let b = bounds(font, g) else {
+                continue
+            }
+            rects[ScaleGroup(s), default: []].append(unscaled.cellRect(bounds: b, advance: advance(font, g)))
+        }
+        var scales = [ScaleGroup: CGFloat]()
+        var offsets = [ScaleGroup: CGFloat]()
+        for (group, list) in rects {
+            let outliers = min(list.count - 1, Int((1.0 - fitQuantile) * Double(list.count)))
+            let needX = list.map { r -> CGFloat in
+                let reach = max(0.5 - r.minX, r.maxX - 0.5)
+                return reach > 0.5 ? 0.5 / reach : 1.0
+            }.sorted()
+            let bottom = list.map { $0.minY }.sorted()[outliers]
+            let top = list.map { $0.maxY }.sorted(by: >)[outliers]
+            let scale = min(1.0, needX[outliers], 1.0 / max(top - bottom, 1e-6))
+            let lo = 0.5 + scale * (bottom - 0.5)
+            let hi = 0.5 + scale * (top - 0.5)
+            var offset: CGFloat = 0.0
+            if lo < 0.0 {
+                offset = -lo
+            } else if hi > 1.0 {
+                offset = 1.0 - hi
+            }
+            scales[group] = scale
+            offsets[group] = offset
+        }
+        return FontLayout(basis: basis, baseline: baseline, scales: scales, offsets: offsets)
+    }
+}
+
 /// 1 文字分のマス目に描いた結果。
 struct CellRender {
     /// マス目 (em x em) の 8bit グレー。row-major、上の行が先。
     let gray: [UInt8]
-    /// マス目の外へ出た墨の割合 (0.0 = 収まっている, 1.0 = 全部はみ出した)
+    /// マス目の外へ出た墨の割合 (0.0 = 収まっている, 1.0 = 全部はみ出した)。
+    /// 配置で収めているので 0 になるはずの値。描画の自己検査として測り続ける
     let overflowRatio: Float
     /// マス目の中に残った墨の量 (画素値の総和。0 なら空画像)
     let insideInk: Float
+    /// 書体の配置のままではマス目からはみ出すので、このグリフだけ平行移動した
+    let moved: Bool
+    /// マス目より大きいので、このグリフだけ縮小した
+    let shrunk: Bool
 }
 
 enum GlyphRenderer {
     /// マス目の外側に取る余白 (em 単位)。はみ出した墨を測るためだけに使い、最後に切り落とす。
     static let overflowPadEm = 1
+    /// 描いた墨がマス目からはみ出したときに描き直す回数の上限
+    static let maxRedraws = 8
 
     /// 1 em 四方のマス目にグリフを描く。
     ///
-    /// - 水平位置は `(em - advance) / 2` で字送り幅を中央に置く。
-    /// - ベースラインはマス目の底から `|descent|` 上げた位置。
-    ///   フォントの ascent + descent が em を超える場合は、その比で按分した位置にする。
-    /// - マス目からはみ出した墨は切り捨て、割合を `overflowRatio` に記録する。
+    /// - 書体の配置 (`FontLayout`): 水平は字送り幅の中央、垂直は書体ごとのベースライン、
+    ///   全体を書体の区分 (`group`) ごとの縮尺でマス目の中心を基準に縮める。
+    /// - それでもマス目からはみ出すグリフは、マス目より大きければマス目の中心を基準に縮小し、
+    ///   マス目の内側へ平行移動する (墨を捨てない)。判定はアウトラインの外接矩形で見積もってから、
+    ///   描いた墨の外接矩形で確かめる (小さい em ではアンチエイリアスの墨がアウトラインの
+    ///   外接矩形より 1px ほど外へ出るため)。墨がはみ出していれば整数 px の平行移動
+    ///   (マス目より大きければ縮小) をして描き直す。
+    /// - 外へ出た墨の割合を `overflowRatio` に記録する (配置が正しければ 0)。
     ///
     /// 返す配列は row-major で行 0 が上端 (`GrayBitmap` が揃える)。
     /// グリフの外接矩形が空なら nil (空白文字など)。
-    static func renderCell(font: CTFont, glyph: CGGlyph, em: Int) -> CellRender? {
-        var g = glyph
-        var bounds = CGRect.zero
-        CTFontGetBoundingRectsForGlyphs(font, .default, &g, &bounds, 1)
-        if bounds.width <= 0 || bounds.height <= 0 || bounds.isNull || bounds.isInfinite {
+    static func renderCell(
+        font: CTFont, glyph: CGGlyph, em: Int, layout: FontLayout, group: FontLayout.ScaleGroup
+    ) -> CellRender? {
+        guard let bounds = FontLayout.bounds(font, glyph) else {
             return nil
         }
+        let advance = FontLayout.advance(font, glyph)
 
-        var advance = CGSize.zero
-        CTFontGetAdvancesForGlyphs(font, .default, &g, &advance, 1)
-
-        let emF = CGFloat(em)
-        let ascent = CTFontGetAscent(font)
-        let descent = CTFontGetDescent(font)   // 正の値で返る
-        let total = ascent + descent
-        // ascent + descent が em を超えるフォントでは、その比でマス目の中に按分する
-        let baselineFromBottom: CGFloat = (total > emF && total > 0)
-            ? emF * descent / total
-            : descent
+        // マス目の左下を原点とする em 比の座標で、書体の縮尺を掛けた外接矩形
+        let unscaled = layout.cellRect(bounds: bounds, advance: advance)
+        var placement = Placement(scale: layout.scale(for: group), tx: 0.0, ty: layout.offset(for: group))
+        var shrunk = false
+        var moved = false
+        // アウトラインで見積もる: マス目より大きければ縮小し、はみ出す辺を内側へ寄せる
+        var rect = placement.apply(unscaled)
+        if rect.width > 1.0 || rect.height > 1.0 {
+            placement.scale *= 1.0 / max(rect.width, rect.height)
+            rect = placement.apply(unscaled)
+            shrunk = true
+        }
+        func shift(_ lo: CGFloat, _ hi: CGFloat) -> CGFloat {
+            if lo < 0.0 { return -lo }
+            if hi > 1.0 { return 1.0 - hi }
+            return 0.0
+        }
+        let sx = shift(rect.minX, rect.maxX)
+        let sy = shift(rect.minY, rect.maxY)
+        placement.tx += sx
+        placement.ty += sy
+        if sx != 0.0 || sy != 0.0 {
+            moved = true
+        }
 
         // はみ出しを測るため、マス目の周囲に overflowPadEm 分の余白を取って描く
         let pad = em * overflowPadEm
         let canvas = em + 2 * pad
-        guard let ctx = GrayBitmap.makeContext(width: canvas, height: canvas) else {
-            return nil
-        }
-
-        ctx.setFillColor(gray: 1.0, alpha: 1.0)
-        ctx.fill(CGRect(x: 0, y: 0, width: canvas, height: canvas))
-        ctx.setAllowsAntialiasing(true)
-        ctx.setShouldAntialias(true)
-        ctx.setAllowsFontSmoothing(false)
-        ctx.setShouldSmoothFonts(false)
-        ctx.setFillColor(gray: 0.0, alpha: 1.0)
-
-        var pos = CGPoint(
-            x: CGFloat(pad) + (emF - advance.width) * 0.5,
-            y: CGFloat(pad) + baselineFromBottom
-        )
-        CTFontDrawGlyphs(font, &g, &pos, 1, ctx)
-
-        // 行の向きは GrayBitmap が揃える (行 0 = 上)
-        guard let canvasGray = GrayBitmap.read(ctx) else {
-            return nil
+        var canvasGray = [UInt8]()
+        var redraws = 0
+        while true {
+            guard let drawn = draw(font: font, glyph: glyph, em: em, canvas: canvas,
+                                   advance: advance, layout: layout, placement: placement) else {
+                return nil
+            }
+            canvasGray = drawn
+            // 描いた墨の外接矩形 (マス目の左上 = 原点の画素座標、行は下向き)
+            guard let ink = inkBounds(canvasGray, canvas: canvas), redraws < maxRedraws else {
+                break
+            }
+            let x0 = ink.minX - pad, x1 = ink.maxX - pad
+            let y0 = ink.minY - pad, y1 = ink.maxY - pad
+            if x0 >= 0 && y0 >= 0 && x1 < em && y1 < em {
+                break
+            }
+            let w = x1 - x0 + 1
+            let h = y1 - y0 + 1
+            if w > em || h > em {
+                placement.scale *= CGFloat(em) / CGFloat(max(w, h) + 1)
+                shrunk = true
+            } else {
+                // 整数 px の平行移動なら描き直しても墨の形は変わらない
+                let dx = x0 < 0 ? -x0 : (x1 >= em ? em - 1 - x1 : 0)
+                let dy = y0 < 0 ? -y0 : (y1 >= em ? em - 1 - y1 : 0)
+                placement.tx += CGFloat(dx) / CGFloat(em)
+                placement.ty -= CGFloat(dy) / CGFloat(em)   // 行は下向き、描画の y は上向き
+                moved = true
+            }
+            redraws += 1
         }
 
         // マス目の中と外の墨を数えつつ、マス目の分だけ取り出す
@@ -730,7 +1016,83 @@ enum GlyphRenderer {
         }
 
         let overflow: Float = totalInk > 0.0 ? (totalInk - insideInk) / totalInk : 0.0
-        return CellRender(gray: cell, overflowRatio: overflow, insideInk: insideInk)
+        return CellRender(gray: cell, overflowRatio: overflow, insideInk: insideInk,
+                          moved: moved, shrunk: shrunk)
+    }
+
+    /// グリフ 1 つ分の縮尺と平行移動 (em 比)。縮尺はマス目の中心が基準
+    private struct Placement {
+        var scale: CGFloat
+        var tx: CGFloat
+        var ty: CGFloat
+
+        func scaled(_ v: CGFloat) -> CGFloat {
+            return 0.5 + scale * (v - 0.5)
+        }
+
+        /// 縮尺 1 のマス目上の矩形をこの配置で写した矩形
+        func apply(_ r: CGRect) -> CGRect {
+            return CGRect(x: scaled(r.minX) + tx, y: scaled(r.minY) + ty,
+                          width: scale * r.width, height: scale * r.height)
+        }
+    }
+
+    /// 周囲に余白を取ったキャンバス (canvas x canvas) の中央のマス目にグリフを描く
+    private static func draw(
+        font: CTFont,
+        glyph: CGGlyph,
+        em: Int,
+        canvas: Int,
+        advance: CGFloat,
+        layout: FontLayout,
+        placement: Placement
+    ) -> [UInt8]? {
+        guard let ctx = GrayBitmap.makeContext(width: canvas, height: canvas) else {
+            return nil
+        }
+        ctx.setFillColor(gray: 1.0, alpha: 1.0)
+        ctx.fill(CGRect(x: 0, y: 0, width: canvas, height: canvas))
+        ctx.setAllowsAntialiasing(true)
+        ctx.setShouldAntialias(true)
+        ctx.setAllowsFontSmoothing(false)
+        ctx.setShouldSmoothFonts(false)
+        ctx.setFillColor(gray: 0.0, alpha: 1.0)
+
+        // グリフ原点 (縮尺 1 では ((1 - advance) / 2, baseline)) を写した位置に、縮尺つきで描く
+        let emF = CGFloat(em)
+        let pad = CGFloat((canvas - em) / 2)
+        let originX = placement.scaled((1.0 - advance) * 0.5) + placement.tx
+        let originY = placement.scaled(layout.baseline) + placement.ty
+        ctx.translateBy(x: pad + emF * originX, y: pad + emF * originY)
+        let drawScale = placement.scale * emF / CTFontGetSize(font)
+        ctx.scaleBy(x: drawScale, y: drawScale)
+        var g = glyph
+        var pos = CGPoint.zero
+        CTFontDrawGlyphs(font, &g, &pos, 1, ctx)
+
+        // 行の向きは GrayBitmap が揃える (行 0 = 上)
+        return GrayBitmap.read(ctx)
+    }
+
+    /// 墨 (紙 255 より濃い画素) の外接矩形。画素座標、行 0 = 上。墨が無ければ nil
+    private static func inkBounds(_ gray: [UInt8], canvas: Int) -> (minX: Int, maxX: Int, minY: Int, maxY: Int)? {
+        var minX = canvas, maxX = -1, minY = canvas, maxY = -1
+        var y = 0
+        while y < canvas {
+            let row = y * canvas
+            var x = 0
+            while x < canvas {
+                if gray[row + x] < 255 {
+                    if x < minX { minX = x }
+                    if x > maxX { maxX = x }
+                    if y < minY { minY = y }
+                    if y > maxY { maxY = y }
+                }
+                x += 1
+            }
+            y += 1
+        }
+        return maxX < 0 ? nil : (minX, maxX, minY, maxY)
     }
 }
 
@@ -902,6 +1264,8 @@ enum ContactSheet {
         drawText("確認文字: " + legend3, in: ctx, at: CGPoint(x: 16, y: CGFloat(height) - 116), font: labelFont, gray: 0.25)
 
         // --- 各行 ---
+        // 書体名の下に配置 (ベースラインの決め方・区分ごとの縮尺) を小さく添える
+        let layoutFont = CTFontCreateCopyWithAttributes(labelFont, 19.0, nil, nil)
         for (row, entry) in fonts.enumerated() {
             // CG は下が原点。行はページ上から並べる
             let top = CGFloat(height - headerHeight - row * cellPx)
@@ -910,9 +1274,16 @@ enum ContactSheet {
             drawText(
                 entry.postScriptName,
                 in: ctx,
-                at: CGPoint(x: 12, y: bottom + CGFloat(cellPx) * 0.5 - 10),
+                at: CGPoint(x: 12, y: bottom + CGFloat(cellPx) * 0.5 + 4),
                 font: labelFont,
                 gray: 0.0
+            )
+            drawText(
+                entry.layout.compactSummary,
+                in: ctx,
+                at: CGPoint(x: 12, y: bottom + CGFloat(cellPx) * 0.5 - 28),
+                font: layoutFont,
+                gray: 0.4
             )
 
             guard let font = entry.fontsBySize[em] ?? entry.fontsBySize.values.first else {
@@ -921,7 +1292,7 @@ enum ContactSheet {
             for (col, ch) in probe.enumerated() {
                 let x = CGFloat(labelWidth + col * cellPx)
                 let rect = CGRect(x: x, y: bottom, width: CGFloat(cellPx), height: CGFloat(cellPx))
-                switch state(of: ch, font: font, em: em) {
+                switch state(of: ch, font: font, em: em, layout: entry.layout) {
                 case .noGlyph:
                     ctx.setFillColor(red: 0.78, green: 0.78, blue: 0.78, alpha: 1)
                     ctx.fill(rect)
@@ -956,14 +1327,16 @@ enum ContactSheet {
         }
     }
 
-    private static func state(of ch: Character, font: CTFont, em: Int) -> CellState {
+    private static func state(of ch: Character, font: CTFont, em: Int, layout: FontLayout) -> CellState {
         guard let scalar = ch.unicodeScalars.first, ch.unicodeScalars.count == 1 else {
             return .noGlyph
         }
         guard let glyph = FontLoader.glyph(font, scalar) else {
             return .noGlyph
         }
-        guard let cell = GlyphRenderer.renderCell(font: font, glyph: glyph, em: em) else {
+        guard let cell = GlyphRenderer.renderCell(
+            font: font, glyph: glyph, em: em, layout: layout, group: FontLayout.ScaleGroup(scalar)
+        ) else {
             return .blank
         }
         guard let image = try? ImageNormalizer.normalize(
@@ -1079,12 +1452,18 @@ struct FontStats: Sendable {
     var skippedNoGlyph = 0
     var skippedBlank = 0
     var samples = 0
+    /// マス目から少しでもはみ出した文字の数 (配置で収めているので 0 のはず)
+    var overflowAny = 0
     /// マス目から 5% 以上はみ出した文字の数
     var overflowOver5 = 0
     /// はみ出し割合の合計 (平均を出すのに使う)
     var overflowSum = 0.0
     /// はみ出し割合の最大
     var overflowMax = 0.0
+    /// 書体の配置のままでははみ出すので平行移動したグリフの数
+    var moved = 0
+    /// マス目より大きいので縮小したグリフの数
+    var shrunk = 0
     var seconds = 0.0
 }
 
@@ -1536,9 +1915,17 @@ func run() {
                     stats.skippedNoGlyph += 1
                     continue
                 }
-                guard let cell = GlyphRenderer.renderCell(font: font, glyph: glyph, em: em) else {
+                guard let cell = GlyphRenderer.renderCell(
+                    font: font, glyph: glyph, em: em, layout: entry.layout,
+                    group: FontLayout.ScaleGroup(item.category)
+                ) else {
                     stats.skippedBlank += 1
                     continue
+                }
+                if cell.moved { stats.moved += 1 }
+                if cell.shrunk { stats.shrunk += 1 }
+                if cell.overflowRatio > 0.0 {
+                    stats.overflowAny += 1
                 }
                 stats.overflowSum += Double(cell.overflowRatio)
                 if Double(cell.overflowRatio) > stats.overflowMax {
@@ -1585,8 +1972,9 @@ func run() {
         let overflowAvg = stats.drawn > 0 ? stats.overflowSum / Double(stats.drawn) : 0.0
         logLine("   [\(namePad)] \(originPad) 描画 \(stats.drawn) / グリフ無し \(stats.skippedNoGlyph)"
             + " / 空画像 \(stats.skippedBlank) / サンプル \(stats.samples)"
-            + " / はみ出し 5%以上 \(stats.overflowOver5) (平均 \(String(format: "%.3f", overflowAvg))"
-            + " 最大 \(String(format: "%.3f", stats.overflowMax)))"
+            + " / \(entry.layout.summary) / 移動 \(stats.moved) / 縮小 \(stats.shrunk)"
+            + " / はみ出し あり \(stats.overflowAny) 5%以上 \(stats.overflowOver5)"
+            + " (平均 \(String(format: "%.3f", overflowAvg)) 最大 \(String(format: "%.3f", stats.overflowMax)))"
             + " / \(String(format: "%.1f", stats.seconds)) 秒")
     }
 
@@ -1652,15 +2040,21 @@ func run() {
     var totalDrawn = 0
     var totalNoGlyph = 0
     var totalBlank = 0
+    var totalOverflowAny = 0
     var totalOverflow5 = 0
     var totalOverflowSum = 0.0
+    var totalMoved = 0
+    var totalShrunk = 0
     var globalOverflowMax = 0.0
     for s in statsBox.stats {
         totalDrawn += s.drawn
         totalNoGlyph += s.skippedNoGlyph
         totalBlank += s.skippedBlank
+        totalOverflowAny += s.overflowAny
         totalOverflow5 += s.overflowOver5
         totalOverflowSum += s.overflowSum
+        totalMoved += s.moved
+        totalShrunk += s.shrunk
         if s.overflowMax > globalOverflowMax {
             globalOverflowMax = s.overflowMax
         }
@@ -1675,8 +2069,18 @@ func run() {
     logLine("   描画成功 \(totalDrawn) / グリフ無しスキップ \(totalNoGlyph) / 空画像スキップ \(totalBlank)")
     let avgOverflow = totalDrawn > 0 ? totalOverflowSum / Double(totalDrawn) : 0.0
     let pct = totalDrawn > 0 ? 100.0 * Double(totalOverflow5) / Double(totalDrawn) : 0.0
-    logLine("   マス目からのはみ出し: 5%以上 \(totalOverflow5) 件 (\(String(format: "%.2f", pct))%)"
+    let fontsScaled = entries.filter { e in e.layout.scales.values.contains { $0 < 1.0 } }.count
+    let typoFonts = entries.filter { $0.layout.basis == .typo }.count
+    logLine("   配置: typo \(typoFonts) 書体 / それ以外 \(entries.count - typoFonts) 書体"
+        + " / 区分の縮尺が 1 未満 \(fontsScaled) 書体 / グリフ単位の調整 移動 \(totalMoved) / 縮小 \(totalShrunk)")
+    logLine("   マス目からのはみ出し: あり \(totalOverflowAny) 件 / 5%以上 \(totalOverflow5) 件 (\(String(format: "%.2f", pct))%)"
         + " / 平均 \(String(format: "%.4f", avgOverflow)) / 最大 \(String(format: "%.3f", globalOverflowMax))")
+    // 見切れた字で学習しない。配置で必ず収めているので、1 件でも残っていれば配置の不具合として止める
+    // (書き出し済みのデータセットは使わないこと)
+    if totalOverflowAny > 0 {
+        fail("マス目からはみ出したサンプルが \(totalOverflowAny) 件あります。書き出したデータセットは使わず、"
+            + "上の書体ごとの統計で「はみ出し」が 0 でない書体を確認してください")
+    }
     if options.limitPerClass > 0 {
         let dropped = trainSink.droppedByLimit + (evalSink?.droppedByLimit ?? 0)
         logLine("   --limit-per-class \(options.limitPerClass) による除外 \(dropped)")
@@ -1706,14 +2110,23 @@ func printFontTable(
     for c in order {
         tsv += "\t" + c.rawValue
     }
-    tsv += "\tdrawable_in_scope\n"
+    tsv += "\tdrawable_in_scope\tlayout_basis\tbaseline"
+    for g in FontLayout.ScaleGroup.allCases {
+        tsv += "\tscale_" + g.rawValue + "\toffset_" + g.rawValue
+    }
+    tsv += "\n"
     for e in sorted {
         tsv += e.postScriptName + "\t" + e.origin.shortLabel + "\t" + e.origin.path
         for c in order {
             let cov = e.coverage[c] ?? (have: 0, total: 0)
             tsv += "\t\(cov.have)/\(cov.total)"
         }
-        tsv += "\t\(e.drawable.count)\n"
+        tsv += "\t\(e.drawable.count)\t\(e.layout.basis.rawValue)\t\(String(format: "%.4f", e.layout.baseline))"
+        for g in FontLayout.ScaleGroup.allCases {
+            tsv += "\t" + (e.layout.scales[g].map { String(format: "%.4f", $0) } ?? "")
+            tsv += "\t" + (e.layout.offsets[g].map { String(format: "%.4f", $0) } ?? "")
+        }
+        tsv += "\n"
     }
     let tsvURL = URL(fileURLWithPath: tsvPath)
     do {
@@ -1755,6 +2168,7 @@ func printFontTable(
         for h in ["digit", "ascii", "upper", "lower", "hira", "kata", "kanji"] {
             header += " " + h.padding(toLength: 11, withPad: " ", startingAt: 0)
         }
+        header += " 配置 (対象区分の縮尺)"
         print(header)
         for e in list.prefix(n) {
             var line = "     " + e.postScriptName.padding(toLength: 34, withPad: " ", startingAt: 0)
@@ -1763,6 +2177,7 @@ func printFontTable(
                 let cov = e.coverage[c] ?? (have: 0, total: 0)
                 line += " " + "\(cov.have)/\(cov.total)".padding(toLength: 11, withPad: " ", startingAt: 0)
             }
+            line += " " + e.layout.summary
             print(line)
         }
     }
